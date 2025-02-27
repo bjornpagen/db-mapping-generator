@@ -902,8 +902,8 @@ if (require.main === module) {
 		const outputDb = await readJsonFile(OUT_DATABASE_PATH);
 		const inputDbs = [inputDb]; // Array of input databases; can be extended to multiple
 
-		// Command-line argument parsing: --no-deps means nodeps=false
-		const nodeps = !process.argv.includes("--no-deps");
+		// Command-line argument parsing: --deps enables dependency analysis
+		const deps = process.argv.includes("--deps");
 		const targetTables = [
 			{ schema: "mysql", table: "party_profile" },
 			{ schema: "mysql", table: "party_role_association" },
@@ -919,7 +919,7 @@ if (require.main === module) {
 			inputDbs,
 			outputDb,
 			targetTables,
-			nodeps,
+			!deps,
 		);
 		console.log(JSON.stringify(mapping, null, 2));
 	})();
