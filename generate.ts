@@ -24,7 +24,7 @@ const OUT_DATABASE_PATH = "sid.mysql.json"
 
 // Configuration interface for specifying hardcoded input and output tables
 interface MappingConfig {
-	inputTables: Record<string, string[]> // dbId (e.g., "tsql_0") to list of table keys (e.g., "dbo.User")
+	inputTables: string[][] // Array of table arrays, where index corresponds to inputDbs index
 	outputTables?: string[] // Optional list of target table keys (e.g., "mysql.party")
 }
 
@@ -174,8 +174,7 @@ function getAllPreviousMappingsSection(
 
 function buildTargetTablesSection(
 	outDb: Database,
-	tableKeys: string[],
-	excludeIdFields = false
+	tableKeys: string[]
 ): string {
 	let section = ""
 	for (const tableKey of tableKeys) {
@@ -183,44 +182,12 @@ function buildTargetTablesSection(
 		if (!table) {
 			throw new Error(`Table ${tableKey} not found in outDb`)
 		}
-
-		// Identify PK columns
-		const pkColumns = new Set<string>()
-		for (const constraint of table.constraints) {
-			if (constraint.constraintType === "primaryKey") {
-				for (const col of constraint.columns) {
-					pkColumns.add(col)
-				}
-			}
-		}
-
-		// Identify FK columns
-		const fkColumns = new Set<string>()
-		for (const constraint of table.constraints) {
-			if (constraint.constraintType === "foreignKey") {
-				fkColumns.add(constraint.sourceColumn)
-			}
-		}
-
-		// Combine PK and FK columns to exclude
-		const excludeColumns = new Set([...pkColumns, ...fkColumns])
-
-		// Get the type map for the table
 		const typeMap = getDatabaseTablesTypeMap(outDb)[tableKey]
-
-		// Filter columns if excludeIdFields is true
-		const columnsToInclude = excludeIdFields
-			? Object.fromEntries(
-					Object.entries(typeMap).filter(([col]) => !excludeColumns.has(col))
-				)
-			: typeMap
-
 		const fkConstraints = table.constraints.filter(
 			(c): c is ForeignKeyConstraint => c.constraintType === "foreignKey"
 		)
-
 		section += `- ${tableKey}:\n  - Columns:\n`
-		for (const [col, type] of Object.entries(columnsToInclude)) {
+		for (const [col, type] of Object.entries(typeMap)) {
 			section += `    - ${col}: ${type}\n`
 		}
 		section += "  - Foreign Key Constraints:\n"
@@ -348,8 +315,8 @@ function generateMappingPromptForTable(
 	>
 ): string {
 	const allTableKeys = outDb.tables.map((t) => `${t.schema}.${t.name}`)
-	const allOutputTablesSection = `**All Output Tables:**\n${buildTargetTablesSection(outDb, allTableKeys, false)}`
-	const targetTableSection = `**Target Table to Map:**\n${buildTargetTablesSection(outDb, [targetTableKey], true)}`
+	const allOutputTablesSection = `**All Output Tables:**\n${buildTargetTablesSection(outDb, allTableKeys)}`
+	const targetTableSection = `**Target Table to Map:**\n${buildTargetTablesSection(outDb, [targetTableKey])}`
 	const relatedTablesSection = "**Related Tables for Context:** None.\n"
 	const allPreviousMappingsSection =
 		getAllPreviousMappingsSection(previousMappings)
@@ -456,7 +423,8 @@ async function generateMappings(
 	// Create a filtered version of inDbs with only the specified input tables
 	const filteredInDbs: Record<string, Database> = {}
 	for (const [dbId, db] of Object.entries(inDbs)) {
-		const tablesToInclude = config.inputTables[dbId] || []
+		const dbIndex = Number.parseInt(dbId.split("_")[1])
+		const tablesToInclude = config.inputTables[dbIndex] || []
 		const filteredTables = db.tables.filter((table) => {
 			const tableKey = `${table.schema}.${table.name}`
 			return tablesToInclude.includes(tableKey)
@@ -611,8 +579,8 @@ if (require.main === module) {
 		const outputDb = await readJsonFile(OUT_DATABASE_PATH)
 		const inputDbs = [inputDb]
 		const config: MappingConfig = {
-			inputTables: {
-				tsql_0: [
+			inputTables: [
+				[
 					"dbo.User",
 					"dbo.Contact",
 					"dbo.UserContactConnector",
@@ -635,7 +603,7 @@ if (require.main === module) {
 					"dbo.Package",
 					"dbo.Service"
 				]
-			},
+			],
 			outputTables: [
 				"mysql.party_profile",
 				"mysql.party_role_association",
