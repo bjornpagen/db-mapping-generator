@@ -1,0 +1,265 @@
+{
+	"columnMappings": [
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "ID",
+			"destinationSchema": "mysql",
+			"destinationTable": "party",
+			"destinationColumn": "ID",
+			"description": "The 'ID' field is the unique identifier for the user. In the TM Forum SID model, a user is represented as a Party; therefore, this source ID maps directly to the 'ID' field of the 'party' table."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "RoleID",
+			"destinationSchema": "mysql",
+			"destinationTable": "party_role",
+			"destinationColumn": "ID",
+			"description": "The 'RoleID' field indicates the role assignment for the user. In SID the party’s role is managed in the 'party_role' table, so this key maps to its 'ID' field."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "CultureID",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'CultureID' field represents a cultural preference in the source system, but there is no corresponding column in the TM Forum SID target schema; therefore it is not mapped."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "CurrencyID",
+			"destinationSchema": "mysql",
+			"destinationTable": "currency",
+			"destinationColumn": "ID",
+			"description": "The 'CurrencyID' field identifies the user’s currency. This numeric key corresponds to the 'ID' field in the 'currency' table in the SID model."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "LanguageID",
+			"destinationSchema": "mysql",
+			"destinationTable": "language",
+			"destinationColumn": "ID",
+			"description": "The 'LanguageID' field specifies the language preference of the user. It maps to the 'ID' field in the 'language' table in the SID model, with type conversion from INT to compatible numeric key."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "OwnerID",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'OwnerID' field in the source is used to reference an owner entity; however, there is no equivalent owner field in the TM Forum SID data model, so it is not mapped."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "Account",
+			"destinationSchema": "mysql",
+			"destinationTable": "account",
+			"destinationColumn": "name",
+			"description": "The 'Account' field contains the user’s account identifier or login name. In the SID model, account details are stored in the 'account' table, and the 'name' column is used for this purpose. A conversion from NVARCHAR to VARCHAR is applied."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "Name",
+			"destinationSchema": "mysql",
+			"destinationTable": "party_profile",
+			"destinationColumn": "name",
+			"description": "The 'Name' field represents the full name of the user. In TM Forum SID, descriptive information about a party (in this case, an individual) is captured in the 'party_profile' table; thus, the source 'Name' maps to its 'name' column."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "Password",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'Password' field appears as clear-text credentials. Due to security concerns, raw passwords are not mapped directly in the SID model. Instead, the encrypted version is stored; therefore this field is not mapped."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "CreatedDate",
+			"destinationSchema": "mysql",
+			"destinationTable": "party_profile",
+			"destinationColumn": "dateCreated",
+			"description": "The 'CreatedDate' field indicates when the user account was created. It maps to the 'dateCreated' field in the 'party_profile' table. A conversion from DATETIME to the expected string format may be required."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "UserStatusTypeID",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'UserStatusTypeID' field is an internal identifier for the user’s status. There is no corresponding descriptive field in the TM Forum SID schema; hence, it is not mapped."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "CreditRatingID",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'CreditRatingID' field is a foreign key indicating a credit rating. In SID, descriptive credit rating information would typically be mapped to a name or description field rather than an identifier. Therefore, this key is not mapped directly."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "BillGroupID",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'BillGroupID' field represents an organizational grouping for billing purposes in the source system, and no equivalent grouping field exists in the TM Forum SID target schema; hence it is not mapped."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "PasswordLastChangedDate",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'PasswordLastChangedDate' field indicates when the password was last modified. Since password management is handled through encrypted credentials in security components of the SID model, this field is not mapped directly."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "ActingOwnerID",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'ActingOwnerID' field represents an alternate owner in the source system. The SID model does not have a corresponding field for this concept; thus it is not mapped."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "ExpireDate",
+			"destinationSchema": "mysql",
+			"destinationTable": "account",
+			"destinationColumn": "validFor",
+			"description": "The 'ExpireDate' field indicates the expiration date for the account. In the SID model, the 'validFor' column in the 'account' table is used to represent the period of validity. This mapping implies that the DATETIME will need to be converted to a formatted validity period string."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "Current_StatusTypeID",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'Current_StatusTypeID' field is an internal identifier for the current status of the user. There is no single matching descriptive field in the SID model; hence it is not mapped."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "CreatedBy",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'CreatedBy' field records which user created this record. The TM Forum SID model does not capture this meta information in a mapped field; therefore, it is unmapped."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "ForcePasswordChangeOnNextLogin",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'ForcePasswordChangeOnNextLogin' field is a security policy flag that mandates a password change. This operational control is not represented in the TM Forum SID model; hence it is not mapped."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "FailedLoginCount",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'FailedLoginCount' field tracks the number of unsuccessful login attempts. Such operational audit data is not part of the TM Forum SID schema; therefore, it is not mapped."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "LastStatusChangedDate",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'LastStatusChangedDate' field records the time when the user’s status last changed. There is no equivalent field in the SID model for capturing status change timestamps, so it is left unmapped."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "LastUpdateDate",
+			"destinationSchema": "mysql",
+			"destinationTable": "account",
+			"destinationColumn": "lastUpdateDate",
+			"description": "The 'LastUpdateDate' field represents the last time the user record was modified. This maps directly to the 'lastUpdateDate' field in the 'account' table of the SID model with necessary conversion from DATETIME to the target string format."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "EffectiveCancelDate",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'EffectiveCancelDate' field signifies the effective cancellation date of the user account, which does not have a specific counterpart in the SID data model; it is therefore not mapped."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "InvoiceConfigurationID",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'InvoiceConfigurationID' field is an identifier for invoice configuration settings in the source system. No analogous field exists in the TM Forum SID schema, so it is not mapped."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "Snapshot_InvoiceConfigurationID",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'Snapshot_InvoiceConfigurationID' field is another invoice configuration identifier for snapshot purposes. It does not have a mapping in the SID model."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "PCISalt",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'PCISalt' field contains cryptographic salt used for password hashing. This security-specific detail does not map to any field in the TM Forum SID data model."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "SalesforceAccountIdentifier",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'SalesforceAccountIdentifier' is an external system identifier for integration with Salesforce. The TM Forum SID model does not include fields for external system identifiers of this nature; therefore, it is not mapped."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "Consented",
+			"destinationSchema": "",
+			"destinationTable": "",
+			"destinationColumn": "",
+			"description": "The 'Consented' flag records whether the user has given consent. While privacy and consent are important, there is no direct field in the SID mapping provided for this; hence it is not mapped."
+		},
+		{
+			"sourceSchema": "dbo",
+			"sourceTable": "User",
+			"sourceColumn": "PasswordEncrypted",
+			"destinationSchema": "mysql",
+			"destinationTable": "credential",
+			"destinationColumn": "PasswordEncrypted",
+			"description": "The 'PasswordEncrypted' field contains the user’s encrypted password. In the TM Forum SID model, credentials are stored in the 'credential' table. This field maps to the 'PasswordEncrypted' column in that table, with appropriate type conversion from NVARCHAR to VARCHAR if necessary."
+		}
+	]
+}

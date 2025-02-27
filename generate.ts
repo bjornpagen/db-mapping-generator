@@ -2,7 +2,7 @@ import fs from "node:fs/promises"
 import * as fsSync from "node:fs"
 import * as path from "node:path"
 import type { Database, ForeignKeyConstraint, Column } from "./relational"
-import type { Mapping, ColumnMapping, SourceColumn } from "./mapping"
+import type { Mapping, ColumnMapping } from "./mapping"
 import dotenv from "dotenv"
 import OpenAI from "openai"
 import { z } from "zod"
@@ -22,10 +22,10 @@ const openai = new OpenAI({
 const IN_DATABASE_PATH = "logisense.tsql.json"
 const OUT_DATABASE_PATH = "sid.mysql.json"
 
-// Configuration interface for specifying hardcoded input and output tables
+// Configuration interface with a single array of source tables
 interface MappingConfig {
-	inputTables: string[][] // Array of table arrays, where index corresponds to inputDbs index
-	outputTables?: string[] // Optional list of target table keys (e.g., "mysql.party")
+	inputTables: string[] // e.g., ["dbo.User", "dbo.Contact"]
+	outputTables?: string[] // Optional list of target table keys
 }
 
 async function readJsonFile(filePath: string): Promise<Database> {
@@ -155,19 +155,16 @@ function formatColumnTypeString(column: Column): string {
 function getAllPreviousMappingsSection(
 	previousMappings: Record<
 		string,
-		{ destination: string; sources: string[]; description: string }[]
+		{ source: string; destination: string; description: string }[]
 	>
 ): string {
-	if (Object.keys(previousMappings).length === 0) {
+	const allMappings = Object.values(previousMappings).flat()
+	if (allMappings.length === 0) {
 		return "**All Previous Mappings:** None.\n"
 	}
 	let section = "**All Previous Mappings:**\n"
-	for (const [tableKey, mappings] of Object.entries(previousMappings)) {
-		section += `- ${tableKey}:\n`
-		for (const mapping of mappings) {
-			const sourcesStr = mapping.sources.map((s) => `"${s}"`).join(", ")
-			section += `  - destination: ${mapping.destination}, sources: [${sourcesStr}], description: "${mapping.description}"\n`
-		}
+	for (const mapping of allMappings) {
+		section += `- source: "${mapping.source}", destination: "${mapping.destination}", description: "${mapping.description}"\n`
 	}
 	return section
 }
@@ -202,28 +199,34 @@ function buildTargetTablesSection(
 	return section
 }
 
-function buildSourceTablesSection(inDbs: Record<string, Database>): string {
-	let section = "**Source Tables:**\n"
-	for (const [dbId, db] of Object.entries(inDbs)) {
-		for (const table of db.tables) {
-			const tableKey = `${dbId}.${table.schema}.${table.name}`
-			const typeMap =
-				getDatabaseTablesTypeMap(db)[`${table.schema}.${table.name}`]
-			const fkConstraints = table.constraints.filter(
-				(c): c is ForeignKeyConstraint => c.constraintType === "foreignKey"
-			)
-			section += `- ${tableKey}:\n  - Columns:\n`
-			for (const [col, type] of Object.entries(typeMap)) {
-				section += `    - ${col}: ${type}\n`
+function buildSourceTablesSection(
+	inputDb: Database,
+	sourceTableKeys: string[]
+): string {
+	let section = "**Source Tables to Map:**\n"
+	for (const tableKey of sourceTableKeys) {
+		const table = inputDb.tables.find(
+			(t) => `${t.schema}.${t.name}` === tableKey
+		)
+		if (!table) {
+			console.warn(`Table ${tableKey} not found in input database`)
+			continue
+		}
+		const typeMap = getDatabaseTablesTypeMap(inputDb)[tableKey]
+		const fkConstraints = table.constraints.filter(
+			(c): c is ForeignKeyConstraint => c.constraintType === "foreignKey"
+		)
+		section += `- ${tableKey}:\n  - Columns:\n`
+		for (const [col, type] of Object.entries(typeMap)) {
+			section += `    - ${col}: ${type}\n`
+		}
+		section += "  - Foreign Key Constraints:\n"
+		if (fkConstraints.length > 0) {
+			for (const fk of fkConstraints) {
+				section += `    - ${fk.sourceColumn} references ${fk.referencedSchema}.${fk.referencedTable}.${fk.referencedColumn}\n`
 			}
-			section += "  - Foreign Key Constraints:\n"
-			if (fkConstraints.length > 0) {
-				for (const fk of fkConstraints) {
-					section += `    - ${fk.sourceColumn} references ${dbId}.${fk.referencedSchema}.${fk.referencedTable}.${fk.referencedColumn}\n`
-				}
-			} else {
-				section += "    - None\n"
-			}
+		} else {
+			section += "    - None\n"
 		}
 	}
 	return section
@@ -231,19 +234,17 @@ function buildSourceTablesSection(inDbs: Record<string, Database>): string {
 
 const mappingInstructions = `
 **Instructions:**
-- Map columns for the specified target table only, aligning with the TMForum SID data model for semantic consistency (e.g., 'mysql.customer' to SID 'Customer', 'mysql.product_offering' to 'ProductOffering').
-- For each target column:
-  - Identify source columns from 'Source Tables' with the same semantic meaning, listing them in 'sources' as '<dbId>.<schema>.<table>.<column>', where <dbId> is the identifier of the source database (e.g., 'tsql_0', 'tsql_1', etc.), and <schema> is the schema of the table (e.g., 'dbo'). If none match, use 'sources: []'.
-  - Provide a complete English description in 'description' explaining how the target column is derived from the source columns or other mechanisms.
-  - If the target column is derived directly from source columns without transformation, state that it is a direct mapping.
-  - If a transformation is required, describe the transformation in plain English, specifying how the source data is manipulated to produce the target value.
-  - For primary keys without sources, describe that it is a surrogate key generated automatically, e.g., using an auto-increment mechanism.
-  - For foreign keys without direct sources, describe that the value is obtained by looking up the referenced table based on the relationship.
-  - For columns with no sources and no special function, describe that the value is set to null or a default value as appropriate.
-  - Respect data types and constraints (e.g., 'NOT NULL'); mention any necessary type conversions in the description.
-  - Avoid mapping ID fields (e.g., columns ending with 'ID') from the source to non-ID fields in the target. IDs typically represent keys, not descriptive data. For instance, do not map 'tsql_0.dbo.User.CreditRatingID' to 'mysql.party_credit_profile.creditRiskRating'; instead, map a descriptive field like 'tsql_0.dbo.CreditRating.Name' if available.
-  - Ensure that the 'description' is a plain English explanation and does not include any code or JavaScript expressions.
-- Every target column must be included in the output, even if unmapped (use 'sources: []' and an appropriate 'description').
+- Map the columns from the specified 'Source Tables to Map' forward to the TMForum SID data model in the target schema.
+- For each column in the source tables:
+  - Identify **one** target column in the 'All Output Tables' section that best matches its semantic meaning, aligning with the TMForum SID data model (e.g., 'dbo.User.Account' might map to 'mysql.party.ID').
+  - Provide the source as '<schema>.<table>.<column>' (e.g., 'dbo.User.Account').
+  - Provide the destination as '<schema>.<table>.<column>' (e.g., 'mysql.party.ID').
+  - If no suitable target column exists, set 'destination' to an empty string and explain in 'description' why it’s unmapped (e.g., not relevant to SID schema).
+  - In 'description', provide a complete English explanation of how the source column maps to the target column or why it doesn’t map, including any necessary transformations (e.g., type conversion, concatenation).
+- Respect data types and constraints (e.g., 'NOT NULL'); mention any necessary type conversions in the description.
+- Avoid mapping ID fields (e.g., columns ending with 'ID') from the source to non-ID fields in the target unless semantically appropriate. IDs typically represent keys, not descriptive data.
+- Ensure that the 'description' is a plain English explanation and does not include any code or JavaScript expressions.
+- Every source column must be included in the output, even if unmapped (use 'destination': '' and an appropriate 'description').
 - Focus solely on column mappings and descriptions; do not specify joins or include implementation details.
 `
 
@@ -253,9 +254,9 @@ const outputFormat = `
 {
   "mappings": [
     {
+      "source": "dbo.source_table.source_column",
       "destination": "mysql.target_table.column",
-      "sources": ["tsql_0.dbo.source_table.source_column"],
-      "description": "A complete English description of the transformation."
+      "description": "A complete English description of the mapping or reason for no mapping."
     },
     ...
   ]
@@ -267,60 +268,48 @@ const example = `
 **Examples:**
 - Direct mapping:
   \`\`\`json
-  { "destination": "mysql.party.ID", "sources": ["tsql_0.dbo.User.Account"], "description": "The 'ID' field in the 'party' table is directly mapped from the 'Account' field in the 'dbo.User' table of the source database 'tsql_0'." }
-  \`\`\`
-- Transformation (concatenation):
-  \`\`\`json
-  { "destination": "mysql.party_name.full_name", "sources": ["tsql_0.dbo.Contact.FirstName", "tsql_0.dbo.Contact.LastName"], "description": "The 'full_name' field is created by concatenating the 'FirstName' and 'LastName' from the 'dbo.Contact' table in the source database 'tsql_0', with a space in between." }
-  \`\`\`
-- Generated surrogate key:
-  \`\`\`json
-  { "destination": "mysql.party.id", "sources": [], "description": "The 'id' field is a surrogate primary key that is automatically generated using an auto-increment mechanism, as there is no corresponding source column." }
-  \`\`\`
-- Foreign key lookup:
-  \`\`\`json
-  { "destination": "mysql.party_role_association.party_role_id", "sources": [], "description": "The 'party_role_id' field references the 'id' of the 'party_role' table. Since there is no direct source column, the value is obtained by looking up the appropriate 'party_role' record based on the defined relationship." }
-  \`\`\`
-- Unmapped column:
-  \`\`\`json
-  { "destination": "mysql.party.description", "sources": [], "description": "There is no corresponding source column for 'description', so this field is set to null." }
+  { "source": "dbo.User.Account", "destination": "mysql.party.ID", "description": "The 'Account' field from 'dbo.User' directly maps to the 'ID' field in the 'party' table as a unique identifier." }
   \`\`\`
 - Type conversion:
   \`\`\`json
-  { "destination": "mysql.party_profile.dateCreated", "sources": ["tsql_0.dbo.User.CreatedDate"], "description": "The 'dateCreated' field is derived from the 'CreatedDate' in the 'dbo.User' table of the source database 'tsql_0', which is a DATETIME. It is converted to a string in ISO format to match the target column's data type." }
+  { "source": "dbo.User.CreatedDate", "destination": "mysql.party_profile.dateCreated", "description": "The 'CreatedDate' field from 'dbo.User', a DATETIME, maps to 'dateCreated' in 'party_profile', converted to a string in ISO format." }
+  \`\`\`
+- Unmapped column:
+  \`\`\`json
+  { "source": "dbo.Contact.InternalNote", "destination": "", "description": "The 'InternalNote' field from 'dbo.Contact' has no corresponding column in the SID schema and is not mapped." }
   \`\`\`
 `
 
 const badExamples = `
 **Bad Examples (Avoid These):**
-- Incorrect mapping of ID to non-ID field:
+- Incorrect ID mapping:
   \`\`\`json
-  { "destination": "mysql.party_credit_profile.creditRiskRating", "sources": ["tsql_0.dbo.User.CreditRatingID"], "description": "Direct mapping from 'tsql_0.dbo.User.CreditRatingID' to 'mysql.party_credit_profile.creditRiskRating'." }
+  { "source": "dbo.User.CreditRatingID", "destination": "mysql.party_credit_profile.creditRiskRating", "description": "Maps 'CreditRatingID' to 'creditRiskRating'." }
   \`\`\`
-  **Reasoning:** 'tsql_0.dbo.User.CreditRatingID' is an ID field, likely a foreign key, and should not be directly mapped to 'creditRiskRating', which is probably a descriptive field. Instead, the descriptive value from the referenced table (e.g., 'tsql_0.dbo.CreditRating.Name') should be mapped.
-- Including code in description:
+  **Reasoning:** 'CreditRatingID' is an ID field and should not map to 'creditRiskRating', a descriptive field. Map to a key field or use a descriptive field like 'dbo.CreditRating.Name'.
+- Code in description:
   \`\`\`json
-  { "destination": "mysql.party.ID", "sources": ["tsql_0.dbo.User.Account"], "description": "Set to arg[0]" }
+  { "source": "dbo.User.Account", "destination": "mysql.party.ID", "description": "Set to arg[0]" }
   \`\`\`
-  **Reasoning:** Descriptions should be in plain English, not using code-like expressions.
+  **Reasoning:** Descriptions must be plain English, not code-like expressions.
 `
 
-function generateMappingPromptForTable(
+function generateMappingPromptForSourceTables(
 	outDb: Database,
-	targetTableKey: string,
-	inDbs: Record<string, Database>,
+	inputDb: Database,
+	sourceTableKeys: string[],
 	previousMappings: Record<
 		string,
-		{ destination: string; sources: string[]; description: string }[]
-	>
+		{ source: string; destination: string; description: string }[]
+	>,
+	outputTables?: string[]
 ): string {
-	const allTableKeys = outDb.tables.map((t) => `${t.schema}.${t.name}`)
-	const allOutputTablesSection = `**All Output Tables:**\n${buildTargetTablesSection(outDb, allTableKeys)}`
-	const targetTableSection = `**Target Table to Map:**\n${buildTargetTablesSection(outDb, [targetTableKey])}`
-	const relatedTablesSection = "**Related Tables for Context:** None.\n"
+	const targetTableKeys =
+		outputTables || outDb.tables.map((t) => `${t.schema}.${t.name}`)
+	const allOutputTablesSection = `**All Output Tables:**\n${buildTargetTablesSection(outDb, targetTableKeys)}`
+	const sourceSection = buildSourceTablesSection(inputDb, sourceTableKeys)
 	const allPreviousMappingsSection =
 		getAllPreviousMappingsSection(previousMappings)
-	const sourceSection = buildSourceTablesSection(inDbs)
 	const intro =
 		"You are a data scientist specializing in mapping application-specific data structures to TM Forum APIs. As an expert in TM Forum standards, OpenAPI, and SID models, you excel at interpreting and aligning data models. Your approach involves analyzing documentation provided for application-specific data structures, carefully considering both field names and descriptions to create precise mappings. You strictly adhere to available documentation, avoiding assumptions about fields that might exist but are not documented."
 
@@ -329,13 +318,9 @@ ${intro}
 
 ${allOutputTablesSection}
 
-${targetTableSection}
-
-${relatedTablesSection}
+${sourceSection}
 
 ${allPreviousMappingsSection}
-
-${sourceSection}
 
 ${mappingInstructions}
 
@@ -345,7 +330,7 @@ ${example}
 
 ${badExamples}
 
-Generate mappings for the target table "${targetTableKey}" only.
+Generate mappings for all columns in the specified source tables listed in 'Source Tables to Map'.
 `
 }
 
@@ -353,6 +338,9 @@ function parseDestination(
 	destination: string,
 	outputDb: Database
 ): { schema: string; table: string; column: string } | null {
+	if (!destination) {
+		return null
+	}
 	const parts = destination.split(".")
 	if (parts.length !== 3 || parts[0] !== "mysql") {
 		console.error(`Invalid destination format: ${destination}`)
@@ -365,44 +353,34 @@ function parseDestination(
 		console.error(`Table ${tableName} not found in output database`)
 		return null
 	}
-	return { schema: table.schema, table: table.name, column: columnName }
+	return { schema: table.schema, table: tableName, column: columnName }
 }
 
 function parseSource(
 	source: string,
-	inDbs: Record<string, Database>
-): SourceColumn<string> | null {
+	inputDb: Database
+): { schema: string; table: string; column: string } | null {
 	const parts = source.split(".")
-	if (parts.length !== 4) {
+	if (parts.length !== 3) {
 		console.error(
-			`Invalid source format: ${source} (expected 4 parts: dbId.schema.table.column)`
+			`Invalid source format: ${source} (expected 3 parts: schema.table.column)`
 		)
 		return null
 	}
-	const [dbId, schema, tableName, columnName] = parts
-	if (!(dbId in inDbs)) {
-		console.error(`Database id ${dbId} not found in input databases`)
-		return null
-	}
-	const db = inDbs[dbId]
-	const table = db.tables.find(
+	const [schema, tableName, columnName] = parts
+	const table = inputDb.tables.find(
 		(t) => t.schema === schema && t.name === tableName
 	)
 	if (!table) {
-		console.error(`Table ${schema}.${tableName} not found in database ${dbId}`)
+		console.error(`Table ${schema}.${tableName} not found in input database`)
 		return null
 	}
-	return {
-		databaseId: dbId,
-		schema: schema,
-		table: tableName,
-		column: columnName
-	}
+	return { schema, table: tableName, column: columnName }
 }
 
 const MappingSchema = z.object({
+	source: z.string(),
 	destination: z.string(),
-	sources: z.array(z.string()),
 	description: z.string()
 })
 
@@ -411,36 +389,25 @@ const MappingsSchema = z.object({
 })
 
 async function generateMappings(
-	inputDbs: Database[],
+	inputDb: Database,
 	outputDb: Database,
 	config: MappingConfig
-): Promise<Mapping<string>> {
-	const inDbs: Record<string, Database> = {}
-	inputDbs.forEach((db, index) => {
-		inDbs[`tsql_${index}`] = db
-	})
-
-	// Create a filtered version of inDbs with only the specified input tables
-	const filteredInDbs: Record<string, Database> = {}
-	for (const [dbId, db] of Object.entries(inDbs)) {
-		const dbIndex = Number.parseInt(dbId.split("_")[1])
-		const tablesToInclude = config.inputTables[dbIndex] || []
-		const filteredTables = db.tables.filter((table) => {
+): Promise<Mapping> {
+	// Filter the input database to only include specified source tables
+	const filteredInputDb: Database = {
+		...inputDb,
+		tables: inputDb.tables.filter((table) => {
 			const tableKey = `${table.schema}.${table.name}`
-			return tablesToInclude.includes(tableKey)
+			return config.inputTables.includes(tableKey)
 		})
-		filteredInDbs[dbId] = { ...db, tables: filteredTables }
 	}
 
-	// Determine target tables from config.outputTables, or use all output tables if not provided
-	const tableKeys =
-		config.outputTables || outputDb.tables.map((t) => `${t.schema}.${t.name}`)
-
+	const sourceTableKeys = config.inputTables
 	const previousMappings: Record<
 		string,
-		{ destination: string; sources: string[]; description: string }[]
+		{ source: string; destination: string; description: string }[]
 	> = {}
-	const allColumnMappings: ColumnMapping<string>[] = []
+	const allColumnMappings: ColumnMapping[] = []
 
 	let debugStream: fsSync.WriteStream | undefined
 	if (process.env.DEBUG_OUTPUT) {
@@ -452,115 +419,107 @@ async function generateMappings(
 		}
 	}
 
-	for (const tableKey of tableKeys) {
-		const prompt = generateMappingPromptForTable(
-			outputDb,
-			tableKey,
-			filteredInDbs, // Use filtered tables for the prompt
-			previousMappings
-		)
-		console.error(`Generating mappings for table: ${tableKey}...`)
-		console.error("Prompt being sent to LLM:")
-		console.error("----------------------------------------")
-		console.error(prompt)
-		console.error("----------------------------------------")
+	// Generate mappings for all source tables in one go
+	const prompt = generateMappingPromptForSourceTables(
+		outputDb,
+		filteredInputDb,
+		sourceTableKeys,
+		previousMappings,
+		config.outputTables
+	)
+	console.error("Generating mappings for all specified source tables...")
+	console.error("Prompt being sent to LLM:")
+	console.error("----------------------------------------")
+	console.error(prompt)
+	console.error("----------------------------------------")
 
-		const completionResult = await tryCatch(
-			openai.chat.completions.create({
-				model: "o3-mini",
-				messages: [{ role: "user", content: prompt }],
-				response_format: { type: "json_object" }
-			})
-		)
+	const completionResult = await tryCatch(
+		openai.chat.completions.create({
+			model: "o3-mini",
+			messages: [{ role: "user", content: prompt }],
+			response_format: { type: "json_object" }
+		})
+	)
 
-		if (completionResult.error) {
-			console.error(
-				`Error calling OpenAI API for table ${tableKey}:`,
-				completionResult.error
+	if (completionResult.error) {
+		console.error("Error calling OpenAI API:", completionResult.error)
+		if (debugStream) {
+			debugStream.write(
+				`Error calling OpenAI API: ${completionResult.error.message}\n\n`
 			)
-			if (debugStream) {
-				debugStream.write(
-					`Error calling OpenAI API for table ${tableKey}: ${completionResult.error.message}\n\n`
-				)
-			}
-			continue
 		}
-
+	} else {
 		const completion = completionResult.data
 		const responseContent = completion.choices[0].message.content
 		if (responseContent) {
 			const parseResult = trySync(() => JSON.parse(responseContent))
 			if (parseResult.error) {
-				console.error(
-					`Error parsing response for table ${tableKey}:`,
-					parseResult.error
-				)
+				console.error("Error parsing response:", parseResult.error)
 				console.error(`Raw response: ${responseContent}`)
 				if (debugStream) {
 					debugStream.write(
-						`Error parsing response for table ${tableKey}: ${parseResult.error.message}\n\n`
+						`Error parsing response: ${parseResult.error.message}\n\n`
 					)
 				}
 			} else {
 				const jsonResponse = parseResult.data
 				const mappingsResult = trySync(() => MappingsSchema.parse(jsonResponse))
 				if (mappingsResult.error) {
-					console.error(
-						`Error validating mappings for table ${tableKey}:`,
-						mappingsResult.error
-					)
+					console.error("Error validating mappings:", mappingsResult.error)
 					if (debugStream) {
 						debugStream.write(
-							`Error validating mappings for table ${tableKey}: ${mappingsResult.error.message}\n\n`
+							`Error validating mappings: ${mappingsResult.error.message}\n\n`
 						)
 					}
 				} else {
 					const mappings = mappingsResult.data.mappings
 					for (const mapping of mappings) {
-						const parsedDestination = parseDestination(
-							mapping.destination,
-							outputDb
-						)
-						if (!parsedDestination) {
+						const parsedSource = parseSource(mapping.source, inputDb)
+						if (!parsedSource) {
 							continue
 						}
-						const sources: SourceColumn<string>[] = []
-						for (const sourceStr of mapping.sources) {
-							const parsedSource = parseSource(sourceStr, inDbs) // Use original inDbs for validation
-							if (parsedSource) {
-								sources.push(parsedSource)
-							}
-						}
-						const columnMapping: ColumnMapping<string> = {
-							sources,
-							destinationSchema: parsedDestination.schema,
-							destinationTable: parsedDestination.table,
-							destinationColumn: parsedDestination.column,
+						const parsedDestination = mapping.destination
+							? parseDestination(mapping.destination, outputDb)
+							: null
+						const columnMapping: ColumnMapping = {
+							sourceSchema: parsedSource.schema,
+							sourceTable: parsedSource.table,
+							sourceColumn: parsedSource.column,
+							destinationSchema: parsedDestination
+								? parsedDestination.schema
+								: "",
+							destinationTable: parsedDestination
+								? parsedDestination.table
+								: "",
+							destinationColumn: parsedDestination
+								? parsedDestination.column
+								: "",
 							description: mapping.description
 						}
 						allColumnMappings.push(columnMapping)
 					}
-					previousMappings[tableKey] = mappings
+					// Store mappings under a generic key since we’re mapping all source tables at once
+					previousMappings.source_tables = mappings
 					if (debugStream) {
-						const mappingEntry = { table: tableKey, mappings }
+						const mappingEntry = { tables: sourceTableKeys, mappings }
 						debugStream.write(`${JSON.stringify(mappingEntry, null, 2)}\n\n`)
 					}
 					console.error(
-						`Processed mappings for ${tableKey}, added ${mappings.length} column mappings`
+						`Processed mappings for source tables, added ${mappings.length} column mappings`
 					)
 				}
 			}
 		} else {
-			console.error(`No content received for table ${tableKey}`)
+			console.error("No content received from OpenAI API")
 			if (debugStream) {
-				debugStream.write(`No content received for table ${tableKey}\n\n`)
+				debugStream.write("No content received from OpenAI API\n\n")
 			}
 		}
 	}
 
-	const finalMapping: Mapping<string> = {
+	const finalMapping: Mapping = {
 		type: "mapping",
-		in: inDbs,
+		in: inputDb,
 		out: outputDb,
 		columnMappings: allColumnMappings
 	}
@@ -577,46 +536,10 @@ if (require.main === module) {
 	;(async () => {
 		const inputDb = await readJsonFile(IN_DATABASE_PATH)
 		const outputDb = await readJsonFile(OUT_DATABASE_PATH)
-		const inputDbs = [inputDb]
 		const config: MappingConfig = {
-			inputTables: [
-				[
-					"dbo.User",
-					"dbo.Contact",
-					"dbo.UserContactConnector",
-					"dbo.ContactType",
-					"dbo.UserPaymentMethod",
-					"dbo.PaymentType",
-					"dbo.Invoice",
-					"dbo.StatementDetails",
-					"dbo.UserInvoicer",
-					"dbo.BillGroup",
-					"dbo.InvoiceConfiguration",
-					"dbo.UserStatusType",
-					"dbo.StatusType",
-					"dbo.CreditRating",
-					"dbo.Owner",
-					"dbo.UserOwner",
-					"dbo.UserParent",
-					"dbo.UserPackage",
-					"dbo.UserService",
-					"dbo.Package",
-					"dbo.Service"
-				]
-			],
-			outputTables: [
-				"mysql.party_profile",
-				"mysql.party_role_association",
-				"mysql.party_role_category",
-				"mysql.party_role_currency",
-				"mysql.party_payment",
-				"mysql.party_role",
-				"mysql.party_credit_profile",
-				"mysql.party_name",
-				"mysql.party"
-			]
+			inputTables: ["dbo.User"]
 		}
-		const mapping = await generateMappings(inputDbs, outputDb, config)
+		const mapping = await generateMappings(inputDb, outputDb, config)
 		console.log(JSON.stringify(mapping, null, 2))
 	})()
 }
