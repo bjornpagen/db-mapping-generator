@@ -1,0 +1,16 @@
+{
+	"name": "db-mapping-generator",
+	"private": true,
+	"devDependencies": {
+		"@types/bun": "latest"
+	},
+	"peerDependencies": {
+		"typescript": "^5"
+	},
+	"dependencies": {
+		"@datastructures-js/priority-queue": "^6.3.2",
+		"dotenv": "^16.4.7",
+		"openai": "^4.85.4",
+		"zod": "^3.24.2"
+	}
+}
