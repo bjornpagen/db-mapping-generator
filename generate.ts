@@ -233,7 +233,7 @@ const mappingInstructions = `
 **Instructions:**
 - Map columns for the specified target table only, aligning with the TMForum SID data model for semantic consistency (e.g., 'mysql.customer' to SID 'Customer', 'mysql.product_offering' to 'ProductOffering').
 - For each target column:
-  - Identify source columns from 'Source Tables' with the same semantic meaning, listing them in 'sources' as '<dbId>.<table>.<column>', where <dbId> is the identifier of the source database (e.g., 'tsql_0', 'tsql_1', etc.). If none match, use 'sources: []'.
+  - Identify source columns from 'Source Tables' with the same semantic meaning, listing them in 'sources' as '<dbId>.<schema>.<table>.<column>', where <dbId> is the identifier of the source database (e.g., 'tsql_0', 'tsql_1', etc.), and <schema> is the schema of the table (e.g., 'dbo'). If none match, use 'sources: []'.
   - Provide a complete English description in 'description' explaining how the target column is derived from the source columns or other mechanisms.
   - If the target column is derived directly from source columns without transformation, state that it is a direct mapping.
   - If a transformation is required, describe the transformation in plain English, specifying how the source data is manipulated to produce the target value.
@@ -241,7 +241,7 @@ const mappingInstructions = `
   - For foreign keys without direct sources, describe that the value is obtained by looking up the referenced table based on the relationship.
   - For columns with no sources and no special function, describe that the value is set to null or a default value as appropriate.
   - Respect data types and constraints (e.g., 'NOT NULL'); mention any necessary type conversions in the description.
-  - Avoid mapping ID fields (e.g., columns ending with 'ID') from the source to non-ID fields in the target. IDs typically represent keys, not descriptive data. For instance, do not map 'tsql_0.User.CreditRatingID' to 'mysql.party_credit_profile.creditRiskRating'; instead, map a descriptive field like 'tsql_0.CreditRating.Name' if available.
+  - Avoid mapping ID fields (e.g., columns ending with 'ID') from the source to non-ID fields in the target. IDs typically represent keys, not descriptive data. For instance, do not map 'tsql_0.dbo.User.CreditRatingID' to 'mysql.party_credit_profile.creditRiskRating'; instead, map a descriptive field like 'tsql_0.dbo.CreditRating.Name' if available.
   - Ensure that the 'description' is a plain English explanation and does not include any code or JavaScript expressions.
 - Every target column must be included in the output, even if unmapped (use 'sources: []' and an appropriate 'description').
 - Focus solely on column mappings and descriptions; do not specify joins or include implementation details.
@@ -254,7 +254,7 @@ const outputFormat = `
   "mappings": [
     {
       "destination": "mysql.target_table.column",
-      "sources": ["tsql_0.source_table.source_column"],
+      "sources": ["tsql_0.dbo.source_table.source_column"],
       "description": "A complete English description of the transformation."
     },
     ...
@@ -267,15 +267,15 @@ const example = `
 **Examples:**
 - Direct mapping:
   \`\`\`json
-  { "destination": "mysql.customer.name", "sources": ["tsql_0.users.full_name"], "description": "The 'name' field in the 'customer' table is directly mapped from the 'full_name' field in the 'users' table of the source database 'tsql_0'." }
+  { "destination": "mysql.party.ID", "sources": ["tsql_0.dbo.User.Account"], "description": "The 'ID' field in the 'party' table is directly mapped from the 'Account' field in the 'dbo.User' table of the source database 'tsql_0'." }
   \`\`\`
 - Transformation (concatenation):
   \`\`\`json
-  { "destination": "mysql.party_name.full_name", "sources": ["tsql_0.contact.first_name", "tsql_0.contact.last_name"], "description": "The 'full_name' field is created by concatenating the 'first_name' and 'last_name' from the 'contact' table in the source database 'tsql_0', with a space in between." }
+  { "destination": "mysql.party_name.full_name", "sources": ["tsql_0.dbo.Contact.FirstName", "tsql_0.dbo.Contact.LastName"], "description": "The 'full_name' field is created by concatenating the 'FirstName' and 'LastName' from the 'dbo.Contact' table in the source database 'tsql_0', with a space in between." }
   \`\`\`
 - Generated surrogate key:
   \`\`\`json
-  { "destination": "mysql.product_offering.id", "sources": [], "description": "The 'id' field is a surrogate primary key that is automatically generated using an auto-increment mechanism, as there is no corresponding source column." }
+  { "destination": "mysql.party.id", "sources": [], "description": "The 'id' field is a surrogate primary key that is automatically generated using an auto-increment mechanism, as there is no corresponding source column." }
   \`\`\`
 - Foreign key lookup:
   \`\`\`json
@@ -283,11 +283,11 @@ const example = `
   \`\`\`
 - Unmapped column:
   \`\`\`json
-  { "destination": "mysql.customer_billing_account.notes", "sources": [], "description": "There is no corresponding source column for 'notes', so this field is set to null." }
+  { "destination": "mysql.party.description", "sources": [], "description": "There is no corresponding source column for 'description', so this field is set to null." }
   \`\`\`
 - Type conversion:
   \`\`\`json
-  { "destination": "mysql.customer.created_date", "sources": ["tsql_0.users.signup_date"], "description": "The 'created_date' field is derived from the 'signup_date' in the source database 'tsql_0', which is a timestamp. It is converted to a string in ISO format to match the target column's data type." }
+  { "destination": "mysql.party_profile.dateCreated", "sources": ["tsql_0.dbo.User.CreatedDate"], "description": "The 'dateCreated' field is derived from the 'CreatedDate' in the 'dbo.User' table of the source database 'tsql_0', which is a DATETIME. It is converted to a string in ISO format to match the target column's data type." }
   \`\`\`
 `
 
@@ -295,12 +295,12 @@ const badExamples = `
 **Bad Examples (Avoid These):**
 - Incorrect mapping of ID to non-ID field:
   \`\`\`json
-  { "destination": "mysql.party_credit_profile.creditRiskRating", "sources": ["tsql_0.User.CreditRatingID"], "description": "Direct mapping from 'tsql_0.User.CreditRatingID' to 'mysql.party_credit_profile.creditRiskRating'." }
+  { "destination": "mysql.party_credit_profile.creditRiskRating", "sources": ["tsql_0.dbo.User.CreditRatingID"], "description": "Direct mapping from 'tsql_0.dbo.User.CreditRatingID' to 'mysql.party_credit_profile.creditRiskRating'." }
   \`\`\`
-  **Reasoning:** 'tsql_0.User.CreditRatingID' is an ID field, likely a foreign key, and should not be directly mapped to 'creditRiskRating', which is probably a descriptive field. Instead, the descriptive value from the referenced table (e.g., 'tsql_0.CreditRating.Name') should be mapped.
+  **Reasoning:** 'tsql_0.dbo.User.CreditRatingID' is an ID field, likely a foreign key, and should not be directly mapped to 'creditRiskRating', which is probably a descriptive field. Instead, the descriptive value from the referenced table (e.g., 'tsql_0.dbo.CreditRating.Name') should be mapped.
 - Including code in description:
   \`\`\`json
-  { "destination": "mysql.customer.name", "sources": ["tsql_0.users.full_name"], "description": "Set to arg[0]" }
+  { "destination": "mysql.party.ID", "sources": ["tsql_0.dbo.User.Account"], "description": "Set to arg[0]" }
   \`\`\`
   **Reasoning:** Descriptions should be in plain English, not using code-like expressions.
 `
@@ -373,27 +373,29 @@ function parseSource(
 	inDbs: Record<string, Database>
 ): SourceColumn<string> | null {
 	const parts = source.split(".")
-	if (parts.length !== 3) {
-		console.error(`Invalid source format: ${source}`)
+	if (parts.length !== 4) {
+		console.error(
+			`Invalid source format: ${source} (expected 4 parts: dbId.schema.table.column)`
+		)
 		return null
 	}
-	const dbId = parts[0]
+	const [dbId, schema, tableName, columnName] = parts
 	if (!(dbId in inDbs)) {
 		console.error(`Database id ${dbId} not found in input databases`)
 		return null
 	}
-	const tableName = parts[1]
-	const columnName = parts[2]
 	const db = inDbs[dbId]
-	const table = db.tables.find((t) => t.name === tableName)
+	const table = db.tables.find(
+		(t) => t.schema === schema && t.name === tableName
+	)
 	if (!table) {
-		console.error(`Table ${tableName} not found in database ${dbId}`)
+		console.error(`Table ${schema}.${tableName} not found in database ${dbId}`)
 		return null
 	}
 	return {
 		databaseId: dbId,
-		schema: table.schema,
-		table: table.name,
+		schema: schema,
+		table: tableName,
 		column: columnName
 	}
 }
