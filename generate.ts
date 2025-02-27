@@ -7,6 +7,7 @@ import dotenv from "dotenv"
 import OpenAI from "openai"
 import { z } from "zod"
 import { tryCatch, trySync } from "./try-catch"
+import { retryWithExponentialBackoff } from "./rate-limiter"
 
 dotenv.config()
 
@@ -152,23 +153,6 @@ function formatColumnTypeString(column: Column): string {
 	return typeString
 }
 
-function getAllPreviousMappingsSection(
-	previousMappings: Record<
-		string,
-		{ source: string; destination: string; description: string }[]
-	>
-): string {
-	const allMappings = Object.values(previousMappings).flat()
-	if (allMappings.length === 0) {
-		return "**All Previous Mappings:** None.\n"
-	}
-	let section = "**All Previous Mappings:**\n"
-	for (const mapping of allMappings) {
-		section += `- source: "${mapping.source}", destination: "${mapping.destination}", description: "${mapping.description}"\n`
-	}
-	return section
-}
-
 function buildTargetTablesSection(
 	outDb: Database,
 	tableKeys: string[]
@@ -298,18 +282,12 @@ function generateMappingPromptForSourceTables(
 	outDb: Database,
 	inputDb: Database,
 	sourceTableKeys: string[],
-	previousMappings: Record<
-		string,
-		{ source: string; destination: string; description: string }[]
-	>,
 	outputTables?: string[]
 ): string {
 	const targetTableKeys =
 		outputTables || outDb.tables.map((t) => `${t.schema}.${t.name}`)
 	const allOutputTablesSection = `**All Output Tables:**\n${buildTargetTablesSection(outDb, targetTableKeys)}`
 	const sourceSection = buildSourceTablesSection(inputDb, sourceTableKeys)
-	const allPreviousMappingsSection =
-		getAllPreviousMappingsSection(previousMappings)
 	const intro =
 		"You are a data scientist specializing in mapping application-specific data structures to TM Forum APIs. As an expert in TM Forum standards, OpenAPI, and SID models, you excel at interpreting and aligning data models. Your approach involves analyzing documentation provided for application-specific data structures, carefully considering both field names and descriptions to create precise mappings. You strictly adhere to available documentation, avoiding assumptions about fields that might exist but are not documented."
 
@@ -319,8 +297,6 @@ ${intro}
 ${allOutputTablesSection}
 
 ${sourceSection}
-
-${allPreviousMappingsSection}
 
 ${mappingInstructions}
 
@@ -393,22 +369,7 @@ async function generateMappings(
 	outputDb: Database,
 	config: MappingConfig
 ): Promise<Mapping> {
-	// Filter the input database to only include specified source tables
-	const filteredInputDb: Database = {
-		...inputDb,
-		tables: inputDb.tables.filter((table) => {
-			const tableKey = `${table.schema}.${table.name}`
-			return config.inputTables.includes(tableKey)
-		})
-	}
-
 	const sourceTableKeys = config.inputTables
-	const previousMappings: Record<
-		string,
-		{ source: string; destination: string; description: string }[]
-	> = {}
-	const allColumnMappings: ColumnMapping[] = []
-
 	let debugStream: fsSync.WriteStream | undefined
 	if (process.env.DEBUG_OUTPUT) {
 		const streamResult = await tryCatch(fs.open(process.env.DEBUG_OUTPUT, "a"))
@@ -419,103 +380,78 @@ async function generateMappings(
 		}
 	}
 
-	// Generate mappings for all source tables in one go
-	const prompt = generateMappingPromptForSourceTables(
-		outputDb,
-		filteredInputDb,
-		sourceTableKeys,
-		previousMappings,
-		config.outputTables
-	)
-	console.error("Generating mappings for all specified source tables...")
-	console.error("Prompt being sent to LLM:")
-	console.error("----------------------------------------")
-	console.error(prompt)
-	console.error("----------------------------------------")
-
-	const completionResult = await tryCatch(
-		openai.chat.completions.create({
-			model: "o3-mini",
-			messages: [{ role: "user", content: prompt }],
-			response_format: { type: "json_object" }
-		})
-	)
-
-	if (completionResult.error) {
-		console.error("Error calling OpenAI API:", completionResult.error)
-		if (debugStream) {
-			debugStream.write(
-				`Error calling OpenAI API: ${completionResult.error.message}\n\n`
+	const mappingPromises = sourceTableKeys.map(async (tableKey) => {
+		const prompt = generateMappingPromptForSourceTables(
+			outputDb,
+			inputDb,
+			[tableKey],
+			config.outputTables
+		)
+		console.error(`Generating mappings for table: ${tableKey}`)
+		try {
+			const completion = await retryWithExponentialBackoff(() =>
+				openai.chat.completions.create({
+					model: "o3-mini",
+					messages: [{ role: "user", content: prompt }],
+					response_format: { type: "json_object" }
+				})
 			)
-		}
-	} else {
-		const completion = completionResult.data
-		const responseContent = completion.choices[0].message.content
-		if (responseContent) {
+			const responseContent = completion.choices[0].message.content
+			if (!responseContent) {
+				console.error(`No content received for table: ${tableKey}`)
+				return []
+			}
 			const parseResult = trySync(() => JSON.parse(responseContent))
 			if (parseResult.error) {
-				console.error("Error parsing response:", parseResult.error)
-				console.error(`Raw response: ${responseContent}`)
-				if (debugStream) {
-					debugStream.write(
-						`Error parsing response: ${parseResult.error.message}\n\n`
-					)
-				}
-			} else {
-				const jsonResponse = parseResult.data
-				const mappingsResult = trySync(() => MappingsSchema.parse(jsonResponse))
-				if (mappingsResult.error) {
-					console.error("Error validating mappings:", mappingsResult.error)
-					if (debugStream) {
-						debugStream.write(
-							`Error validating mappings: ${mappingsResult.error.message}\n\n`
-						)
-					}
-				} else {
-					const mappings = mappingsResult.data.mappings
-					for (const mapping of mappings) {
-						const parsedSource = parseSource(mapping.source, inputDb)
-						if (!parsedSource) {
-							continue
-						}
-						const parsedDestination = mapping.destination
-							? parseDestination(mapping.destination, outputDb)
-							: null
-						const columnMapping: ColumnMapping = {
-							sourceSchema: parsedSource.schema,
-							sourceTable: parsedSource.table,
-							sourceColumn: parsedSource.column,
-							destinationSchema: parsedDestination
-								? parsedDestination.schema
-								: "",
-							destinationTable: parsedDestination
-								? parsedDestination.table
-								: "",
-							destinationColumn: parsedDestination
-								? parsedDestination.column
-								: "",
-							description: mapping.description
-						}
-						allColumnMappings.push(columnMapping)
-					}
-					// Store mappings under a generic key since we’re mapping all source tables at once
-					previousMappings.source_tables = mappings
-					if (debugStream) {
-						const mappingEntry = { tables: sourceTableKeys, mappings }
-						debugStream.write(`${JSON.stringify(mappingEntry, null, 2)}\n\n`)
-					}
-					console.error(
-						`Processed mappings for source tables, added ${mappings.length} column mappings`
-					)
-				}
+				console.error(
+					`Error parsing JSON for table ${tableKey}:`,
+					parseResult.error
+				)
+				return []
 			}
-		} else {
-			console.error("No content received from OpenAI API")
+			const jsonResponse = parseResult.data
+			const validateResult = trySync(() => MappingsSchema.parse(jsonResponse))
+			if (validateResult.error) {
+				console.error(
+					`Error validating mappings for table ${tableKey}:`,
+					validateResult.error
+				)
+				return []
+			}
+			const mappings = validateResult.data.mappings
+			const columnMappings: ColumnMapping[] = []
+			for (const mapping of mappings) {
+				const parsedSource = parseSource(mapping.source, inputDb)
+				if (!parsedSource) {
+					continue
+				}
+				const parsedDestination = mapping.destination
+					? parseDestination(mapping.destination, outputDb)
+					: null
+				const columnMapping: ColumnMapping = {
+					sourceSchema: parsedSource.schema,
+					sourceTable: parsedSource.table,
+					sourceColumn: parsedSource.column,
+					destinationSchema: parsedDestination ? parsedDestination.schema : "",
+					destinationTable: parsedDestination ? parsedDestination.table : "",
+					destinationColumn: parsedDestination ? parsedDestination.column : "",
+					description: mapping.description
+				}
+				columnMappings.push(columnMapping)
+			}
 			if (debugStream) {
-				debugStream.write("No content received from OpenAI API\n\n")
+				const mappingEntry = { table: tableKey, mappings }
+				debugStream.write(`${JSON.stringify(mappingEntry, null, 2)}\n\n`)
 			}
+			return columnMappings
+		} catch (error) {
+			console.error(`Error processing table ${tableKey}:`, error)
+			return []
 		}
-	}
+	})
+
+	const allColumnMappingsArrays = await Promise.all(mappingPromises)
+	const allColumnMappings = allColumnMappingsArrays.flat()
 
 	const finalMapping: Mapping = {
 		type: "mapping",
@@ -537,7 +473,29 @@ if (require.main === module) {
 		const inputDb = await readJsonFile(IN_DATABASE_PATH)
 		const outputDb = await readJsonFile(OUT_DATABASE_PATH)
 		const config: MappingConfig = {
-			inputTables: ["dbo.User"]
+			inputTables: [
+				"dbo.User",
+				"dbo.Contact",
+				"dbo.UserContactConnector",
+				"dbo.ContactType",
+				"dbo.UserPaymentMethod",
+				"dbo.PaymentType",
+				"dbo.Invoice",
+				"dbo.StatementDetails",
+				"dbo.UserInvoicer",
+				"dbo.BillGroup",
+				"dbo.InvoiceConfiguration",
+				"dbo.UserStatusType",
+				"dbo.StatusType",
+				"dbo.CreditRating",
+				"dbo.Owner",
+				"dbo.UserOwner",
+				"dbo.UserParent",
+				"dbo.UserPackage",
+				"dbo.UserService",
+				"dbo.Package",
+				"dbo.Service"
+			]
 		}
 		const mapping = await generateMappings(inputDb, outputDb, config)
 		console.log(JSON.stringify(mapping, null, 2))
