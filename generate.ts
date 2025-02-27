@@ -22,9 +22,10 @@ const openai = new OpenAI({
 const IN_DATABASE_PATH = "logisense.tsql.json"
 const OUT_DATABASE_PATH = "sid.mysql.json"
 
-// Configuration interface for specifying hardcoded input tables
+// Configuration interface for specifying hardcoded input and output tables
 interface MappingConfig {
 	inputTables: Record<string, string[]> // dbId (e.g., "tsql_0") to list of table keys (e.g., "dbo.User")
+	outputTables?: string[] // Optional list of target table keys (e.g., "mysql.party")
 }
 
 async function readJsonFile(filePath: string): Promise<Database> {
@@ -319,7 +320,7 @@ function generateMappingPromptForTable(
 		getAllPreviousMappingsSection(previousMappings)
 	const sourceSection = buildSourceTablesSection(inDbs)
 	const intro =
-		"You are mapping columns from source databases to a target table in a telecom database following the TMForum SID data model."
+		"You are a data scientist specializing in mapping application-specific data structures to TM Forum APIs. As an expert in TM Forum standards, OpenAPI, and SID models, you excel at interpreting and aligning data models. Your approach involves analyzing documentation provided for application-specific data structures, carefully considering both field names and descriptions to create precise mappings. You strictly adhere to available documentation, avoiding assumptions about fields that might exist but are not documented."
 
 	return `
 ${intro}
@@ -406,7 +407,6 @@ const MappingsSchema = z.object({
 async function generateMappings(
 	inputDbs: Database[],
 	outputDb: Database,
-	targetTables: { schema: string; table: string }[],
 	config: MappingConfig
 ): Promise<Mapping<string>> {
 	const inDbs: Record<string, Database> = {}
@@ -414,7 +414,7 @@ async function generateMappings(
 		inDbs[`tsql_${index}`] = db
 	})
 
-	// Create a filtered version of inDbs with only the specified tables
+	// Create a filtered version of inDbs with only the specified input tables
 	const filteredInDbs: Record<string, Database> = {}
 	for (const [dbId, db] of Object.entries(inDbs)) {
 		const tablesToInclude = config.inputTables[dbId] || []
@@ -425,7 +425,9 @@ async function generateMappings(
 		filteredInDbs[dbId] = { ...db, tables: filteredTables }
 	}
 
-	const tableKeys = targetTables.map((t) => `${t.schema}.${t.table}`)
+	// Determine target tables from config.outputTables, or use all output tables if not provided
+	const tableKeys =
+		config.outputTables || outputDb.tables.map((t) => `${t.schema}.${t.name}`)
 
 	const previousMappings: Record<
 		string,
@@ -569,17 +571,6 @@ if (require.main === module) {
 		const inputDb = await readJsonFile(IN_DATABASE_PATH)
 		const outputDb = await readJsonFile(OUT_DATABASE_PATH)
 		const inputDbs = [inputDb]
-		const targetTables = [
-			{ schema: "mysql", table: "party_profile" },
-			{ schema: "mysql", table: "party_role_association" },
-			{ schema: "mysql", table: "party_role_category" },
-			{ schema: "mysql", table: "party_role_currency" },
-			{ schema: "mysql", table: "party_payment" },
-			{ schema: "mysql", table: "party_role" },
-			{ schema: "mysql", table: "party_credit_profile" },
-			{ schema: "mysql", table: "party_name" },
-			{ schema: "mysql", table: "party" }
-		]
 		const config: MappingConfig = {
 			inputTables: {
 				tsql_0: [
@@ -605,14 +596,20 @@ if (require.main === module) {
 					"dbo.Package",
 					"dbo.Service"
 				]
-			}
+			},
+			outputTables: [
+				"mysql.party_profile",
+				"mysql.party_role_association",
+				"mysql.party_role_category",
+				"mysql.party_role_currency",
+				"mysql.party_payment",
+				"mysql.party_role",
+				"mysql.party_credit_profile",
+				"mysql.party_name",
+				"mysql.party"
+			]
 		}
-		const mapping = await generateMappings(
-			inputDbs,
-			outputDb,
-			targetTables,
-			config
-		)
+		const mapping = await generateMappings(inputDbs, outputDb, config)
 		console.log(JSON.stringify(mapping, null, 2))
 	})()
 }
