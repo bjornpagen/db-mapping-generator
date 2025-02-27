@@ -314,6 +314,8 @@ function generateMappingPromptForTable(
 		{ destination: string; sources: string[]; description: string }[]
 	>
 ): string {
+	const allTableKeys = outDb.tables.map((t) => `${t.schema}.${t.name}`)
+	const allOutputTablesSection = `**All Output Tables:**\n${buildTargetTablesSection(outDb, allTableKeys)}`
 	const targetTableSection = `**Target Table to Map:**\n${buildTargetTablesSection(outDb, [targetTableKey])}`
 	const relatedTablesSection = "**Related Tables for Context:** None.\n"
 	const allPreviousMappingsSection =
@@ -324,6 +326,8 @@ function generateMappingPromptForTable(
 
 	return `
 ${intro}
+
+${allOutputTablesSection}
 
 ${targetTableSection}
 
