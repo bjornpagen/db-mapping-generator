@@ -11,9 +11,7 @@ import type { Mapping, ColumnMapping, SourceColumn } from "./mapping";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import { z } from "zod";
-import { MinPriorityQueue } from "@datastructures-js/priority-queue";
 import { tryCatch, trySync } from "./try-catch";
-import { tarjan } from "./tarjan";
 
 dotenv.config();
 
@@ -62,30 +60,25 @@ function validateDatabase(database: Database): Database {
 			"Invalid database structure: missing 'type' property or not 'database'",
 		);
 	}
-
 	if (!database.dialect || !["tsql", "mysql"].includes(database.dialect)) {
 		throw new Error(
 			"Invalid database structure: missing or invalid 'dialect' property",
 		);
 	}
-
 	if (!Array.isArray(database.tables)) {
 		throw new Error("Invalid database structure: 'tables' must be an array");
 	}
-
 	for (const table of database.tables) {
 		if (table.type !== "table") {
 			throw new Error(
 				`Invalid table structure in table: ${table.name || "unknown"}`,
 			);
 		}
-
 		if (!table.columns || !Array.isArray(table.columns)) {
 			throw new Error(
 				`Missing or invalid columns in table: ${table.name || "unknown"}`,
 			);
 		}
-
 		if (!table.constraints || !Array.isArray(table.constraints)) {
 			throw new Error(
 				`Missing or invalid constraints in table: ${table.name || "unknown"}`,
@@ -99,12 +92,10 @@ export function getDatabaseTablesMap(
 	database: Database,
 ): Record<string, string[]> {
 	const result: Record<string, string[]> = {};
-
 	for (const table of database.tables) {
 		const tableKey = `${table.schema}.${table.name}`;
 		result[tableKey] = table.columns.map((column) => column.name);
 	}
-
 	return result;
 }
 
@@ -112,22 +103,18 @@ export function getDatabaseTablesTypeMap(
 	database: Database,
 ): Record<string, Record<string, string>> {
 	const result: Record<string, Record<string, string>> = {};
-
 	for (const table of database.tables) {
 		const tableKey = `${table.schema}.${table.name}`;
 		result[tableKey] = {};
-
 		for (const column of table.columns) {
 			result[tableKey][column.name] = formatColumnTypeString(column);
 		}
 	}
-
 	return result;
 }
 
 function formatColumnTypeString(column: Column): string {
 	let typeString = column.dataType.toUpperCase();
-
 	switch (column.typeInfo.kind) {
 		case "varchar":
 		case "nvarchar":
@@ -155,232 +142,13 @@ function formatColumnTypeString(column: Column): string {
 		case "integer":
 			break;
 	}
-
 	if (!column.isNullable) {
 		typeString += " NOT NULL";
 	}
-
 	if (column.defaultValue !== undefined) {
 		typeString += ` DEFAULT ${column.defaultValue}`;
 	}
-
 	return typeString;
-}
-
-function getAllDependencies(
-	database: Database,
-	schema: string,
-	tableName: string,
-	visited: Set<string> = new Set(),
-): Set<string> {
-	const tableKey = `${schema}.${tableName}`;
-	if (visited.has(tableKey)) {
-		return visited;
-	}
-	visited.add(tableKey);
-
-	const table = database.tables.find(
-		(t) => t.schema === schema && t.name === tableName,
-	);
-	if (!table) {
-		throw new Error(`Table ${tableKey} not found`);
-	}
-
-	const fkConstraints = table.constraints.filter(
-		(c): c is ForeignKeyConstraint => c.constraintType === "foreignKey",
-	);
-
-	for (const fk of fkConstraints) {
-		const depSchema = fk.referencedSchema;
-		const depTable = fk.referencedTable;
-		getAllDependencies(database, depSchema, depTable, visited);
-	}
-
-	return visited;
-}
-
-function getAllDependenciesForTables(
-	database: Database,
-	tableKeys: string[],
-): Set<string> {
-	const allDependencies = new Set<string>();
-	for (const tableKey of tableKeys) {
-		const [schema, name] = tableKey.split(".");
-		const dependencies = getAllDependencies(database, schema, name);
-		for (const dep of dependencies) {
-			allDependencies.add(dep);
-		}
-	}
-	return allDependencies;
-}
-
-function buildDependencyGraph(
-	outDb: Database,
-	includeTables: Set<string>,
-): Map<string, Set<string>> {
-	const graph = new Map<string, Set<string>>();
-
-	for (const tableKey of includeTables) {
-		graph.set(tableKey, new Set());
-	}
-
-	for (const table of outDb.tables) {
-		const tableKey = `${table.schema}.${table.name}`;
-		if (!includeTables.has(tableKey)) {
-			continue;
-		}
-
-		const fkConstraints = table.constraints.filter(
-			(c): c is ForeignKeyConstraint => c.constraintType === "foreignKey",
-		);
-		for (const fk of fkConstraints) {
-			const referencedTableKey = `${fk.referencedSchema}.${fk.referencedTable}`;
-			if (includeTables.has(referencedTableKey)) {
-				const dependents = graph.get(referencedTableKey) || new Set<string>();
-				dependents.add(tableKey);
-				graph.set(referencedTableKey, dependents);
-			}
-		}
-	}
-
-	return graph;
-}
-
-function findSCCs(graph: Map<string, Set<string>>): string[][] {
-	const adjList: { [key: string]: string[] } = {};
-	for (const [node, neighbors] of graph) {
-		adjList[node] = Array.from(neighbors);
-	}
-	const sccs = tarjan(adjList);
-	return sccs;
-}
-
-function buildCondensedGraph(
-	sccs: string[][],
-	graph: Map<string, Set<string>>,
-): Map<string, Set<string>> {
-	const sccMap: { [key: string]: string } = {};
-	for (let index = 0; index < sccs.length; index++) {
-		const scc = sccs[index];
-		const sccId = `SCC_${index}`;
-		for (const node of scc) {
-			sccMap[node] = sccId;
-		}
-	}
-
-	const condensedGraph = new Map<string, Set<string>>();
-
-	for (const scc of sccs) {
-		const sccId = sccMap[scc[0]];
-		condensedGraph.set(sccId, new Set());
-	}
-
-	for (const [node, neighbors] of graph) {
-		const sccId = sccMap[node];
-		for (const neighbor of neighbors) {
-			const neighborSccId = sccMap[neighbor];
-			if (sccId !== neighborSccId) {
-				const sccSet = condensedGraph.get(sccId);
-				if (sccSet) {
-					sccSet.add(neighborSccId);
-				}
-			}
-		}
-	}
-
-	return condensedGraph;
-}
-
-function topologicalSortSCCs(
-	condensedGraph: Map<string, Set<string>>,
-): string[] {
-	const incomingEdges = new Map<string, number>();
-	const outgoingEdges = new Map<string, number>();
-	for (const sccId of condensedGraph.keys()) {
-		incomingEdges.set(sccId, 0);
-		outgoingEdges.set(sccId, condensedGraph.get(sccId)?.size || 0);
-	}
-	for (const deps of condensedGraph.values()) {
-		for (const dep of deps) {
-			incomingEdges.set(dep, (incomingEdges.get(dep) || 0) + 1);
-		}
-	}
-
-	const queue = new MinPriorityQueue<{ sccId: string; outgoing: number }>(
-		(item) => item.outgoing,
-	);
-
-	for (const [sccId, count] of incomingEdges) {
-		if (count === 0) {
-			queue.enqueue({ sccId, outgoing: outgoingEdges.get(sccId) || 0 });
-		}
-	}
-
-	const sortedSCCs: string[] = [];
-	while (!queue.isEmpty()) {
-		const item = queue.dequeue();
-		if (item === null) {
-			continue;
-		}
-
-		const { sccId } = item;
-		sortedSCCs.push(sccId);
-		const dependents = condensedGraph.get(sccId) || new Set();
-		for (const dep of dependents) {
-			const currentCount = incomingEdges.get(dep) || 0;
-			incomingEdges.set(dep, currentCount - 1);
-			if (incomingEdges.get(dep) === 0) {
-				queue.enqueue({ sccId: dep, outgoing: outgoingEdges.get(dep) || 0 });
-			}
-		}
-	}
-
-	if (sortedSCCs.length !== condensedGraph.size) {
-		throw new Error("Cycle detected in the condensed graph");
-	}
-
-	return sortedSCCs;
-}
-
-function getIncomingFkCount(database: Database, tableKey: string): number {
-	let count = 0;
-	for (const table of database.tables) {
-		const fkConstraints = table.constraints.filter(
-			(c): c is ForeignKeyConstraint => c.constraintType === "foreignKey",
-		);
-		for (const fk of fkConstraints) {
-			const referencedTableKey = `${fk.referencedSchema}.${fk.referencedTable}`;
-			if (referencedTableKey === tableKey) {
-				count++;
-			}
-		}
-	}
-	return count;
-}
-
-function getOutgoingFkCount(table: Table): number {
-	const fkConstraints = table.constraints.filter(
-		(c): c is ForeignKeyConstraint => c.constraintType === "foreignKey",
-	);
-	return fkConstraints.length;
-}
-
-function sortTablesInSCC(database: Database, sccTables: string[]): string[] {
-	return sccTables.sort((a, b) => {
-		const aTable = database.tables.find((t) => `${t.schema}.${t.name}` === a);
-		const bTable = database.tables.find((t) => `${t.schema}.${t.name}` === b);
-		if (!aTable || !bTable) {
-			return 0;
-		}
-		const aOutgoing = getOutgoingFkCount(aTable);
-		const bOutgoing = getOutgoingFkCount(bTable);
-		if (aOutgoing !== bOutgoing) {
-			return aOutgoing - bOutgoing;
-		}
-		const aIncoming = getIncomingFkCount(database, a);
-		const bIncoming = getIncomingFkCount(database, b);
-		return aIncoming - bIncoming;
-	});
 }
 
 function getAllPreviousMappingsSection(
@@ -538,84 +306,23 @@ const badExamples = `
   **Reasoning:** Descriptions should be in plain English, not using code-like expressions.
 `;
 
-function getImmediateNeighbors(
-	database: Database,
-	tableKey: string,
-	sccTables: string[],
-): string[] {
-	const [schema, name] = tableKey.split(".");
-	const table = database.tables.find(
-		(t) => t.schema === schema && t.name === name,
-	);
-	if (!table) {
-		return [];
-	}
-	const neighbors = new Set<string>();
-
-	const fkConstraints = table.constraints.filter(
-		(c): c is ForeignKeyConstraint => c.constraintType === "foreignKey",
-	);
-	for (const fk of fkConstraints) {
-		const refTableKey = `${fk.referencedSchema}.${fk.referencedTable}`;
-		if (sccTables.includes(refTableKey)) {
-			neighbors.add(refTableKey);
-		}
-	}
-
-	for (const otherTable of database.tables) {
-		const otherTableKey = `${otherTable.schema}.${otherTable.name}`;
-		if (!sccTables.includes(otherTableKey)) {
-			continue;
-		}
-		const otherFkConstraints = otherTable.constraints.filter(
-			(c): c is ForeignKeyConstraint => c.constraintType === "foreignKey",
-		);
-		for (const fk of otherFkConstraints) {
-			if (fk.referencedSchema === schema && fk.referencedTable === name) {
-				neighbors.add(otherTableKey);
-			}
-		}
-	}
-
-	return Array.from(neighbors);
-}
-
 function generateMappingPromptForTable(
 	outDb: Database,
 	targetTableKey: string,
-	sccTables: string[] | null,
 	inDbs: Record<string, Database>,
 	previousMappings: Record<
 		string,
 		{ destination: string; sources: string[]; description: string }[]
 	>,
 ): string {
-	const isInSCC = sccTables !== null && sccTables.length > 1;
 	const targetTableSection = `**Target Table to Map:**\n${buildTargetTablesSection(outDb, [targetTableKey])}`;
-	let relatedTablesSection = "";
-	if (isInSCC) {
-		const immediateNeighbors = getImmediateNeighbors(
-			outDb,
-			targetTableKey,
-			sccTables,
-		);
-		if (immediateNeighbors.length > 0) {
-			relatedTablesSection = `**Related Tables for Context:**\n${buildTargetTablesSection(outDb, immediateNeighbors)}`;
-		} else {
-			relatedTablesSection = "**Related Tables for Context:** None.\n";
-		}
-	} else {
-		relatedTablesSection = "**Related Tables for Context:** None.\n";
-	}
+	const relatedTablesSection = "**Related Tables for Context:** None.\n";
 	const allPreviousMappingsSection =
 		getAllPreviousMappingsSection(previousMappings);
 	const sourceSection = buildSourceTablesSection(inDbs);
-	let intro =
+	const intro =
 		"You are mapping columns from source databases to a target table in a telecom database following the TMForum SID data model.";
-	if (isInSCC) {
-		intro +=
-			" The target table is part of a group of related tables with cyclic dependencies. Consider its relationships with the included neighboring tables when mapping.";
-	}
+
 	return `
 ${intro}
 
@@ -639,7 +346,6 @@ Generate mappings for the target table "${targetTableKey}" only.
 `;
 }
 
-// Parsing functions for destination and sources
 function parseDestination(
 	destination: string,
 	outputDb: Database,
@@ -699,20 +405,10 @@ const MappingsSchema = z.object({
 	mappings: z.array(MappingSchema),
 });
 
-/**
- * Generates mappings between source and target database tables.
- *
- * @param inputDbs - Array of input databases.
- * @param outputDb - The output database.
- * @param targetTables - Array of tables to generate mappings for, each with schema and table name.
- * @param nodeps - If true, ignores dependencies and processes only the target tables (default: true).
- * @returns A promise resolving to the mapping object containing column mappings.
- */
 async function generateMappings(
 	inputDbs: Database[],
 	outputDb: Database,
 	targetTables: { schema: string; table: string }[],
-	nodeps = true,
 ): Promise<Mapping<string>> {
 	const inDbs: Record<string, Database> = {};
 	inputDbs.forEach((db, index) => {
@@ -721,41 +417,10 @@ async function generateMappings(
 
 	const tableKeys = targetTables.map((t) => `${t.schema}.${t.table}`);
 
-	let tablesToInclude: Set<string>;
-	let tablesWithContext: [string, string[] | null][];
-
-	if (nodeps) {
-		console.error("Running in nodeps mode: ignoring dependencies.");
-		tablesToInclude = new Set(tableKeys);
-		tablesWithContext = tableKeys.map((key) => [key, null]);
-	} else {
-		console.error("Running in dependency mode: considering dependencies.");
-		tablesToInclude = getAllDependenciesForTables(outputDb, tableKeys);
-		const graph = buildDependencyGraph(outputDb, tablesToInclude);
-		const sccs = findSCCs(graph);
-		const condensedGraph = buildCondensedGraph(sccs, graph);
-		const sortedSCCs = topologicalSortSCCs(condensedGraph);
-		const sccIdToSortedTables: Record<string, string[]> = {};
-		sortedSCCs.forEach((sccId, index) => {
-			const sccTables = sccs[index];
-			const sortedSccTables = sortTablesInSCC(outputDb, sccTables);
-			sccIdToSortedTables[sccId] = sortedSccTables;
-		});
-		tablesWithContext = [];
-		for (const sccId of sortedSCCs) {
-			const sccTables = sccIdToSortedTables[sccId];
-			for (const tableKey of sccTables) {
-				const context = sccTables.length > 1 ? sccTables : null;
-				tablesWithContext.push([tableKey, context]);
-			}
-		}
-	}
-
 	const previousMappings: Record<
 		string,
 		{ destination: string; sources: string[]; description: string }[]
 	> = {};
-
 	const allColumnMappings: ColumnMapping<string>[] = [];
 
 	let debugStream: fsSync.WriteStream | undefined;
@@ -768,11 +433,10 @@ async function generateMappings(
 		}
 	}
 
-	for (const [tableKey, sccTables] of tablesWithContext) {
+	for (const tableKey of tableKeys) {
 		const prompt = generateMappingPromptForTable(
 			outputDb,
 			tableKey,
-			sccTables,
 			inDbs,
 			previousMappings,
 		);
@@ -861,10 +525,7 @@ async function generateMappings(
 					}
 					previousMappings[tableKey] = mappings;
 					if (debugStream) {
-						const mappingEntry = {
-							table: tableKey,
-							mappings: mappings,
-						};
+						const mappingEntry = { table: tableKey, mappings };
 						debugStream.write(`${JSON.stringify(mappingEntry, null, 2)}\n\n`);
 					}
 					console.error(
@@ -897,13 +558,9 @@ async function generateMappings(
 
 if (require.main === module) {
 	(async () => {
-		// Load databases
 		const inputDb = await readJsonFile(IN_DATABASE_PATH);
 		const outputDb = await readJsonFile(OUT_DATABASE_PATH);
-		const inputDbs = [inputDb]; // Array of input databases; can be extended to multiple
-
-		// Command-line argument parsing: --deps enables dependency analysis
-		const deps = process.argv.includes("--deps");
+		const inputDbs = [inputDb];
 		const targetTables = [
 			{ schema: "mysql", table: "party_profile" },
 			{ schema: "mysql", table: "party_role_association" },
@@ -915,12 +572,7 @@ if (require.main === module) {
 			{ schema: "mysql", table: "party_name" },
 			{ schema: "mysql", table: "party" },
 		];
-		const mapping = await generateMappings(
-			inputDbs,
-			outputDb,
-			targetTables,
-			!deps,
-		);
+		const mapping = await generateMappings(inputDbs, outputDb, targetTables);
 		console.log(JSON.stringify(mapping, null, 2));
 	})();
 }
