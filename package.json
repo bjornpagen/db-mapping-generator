@@ -10,7 +10,9 @@
 	"dependencies": {
 		"@datastructures-js/priority-queue": "^6.3.2",
 		"dotenv": "^16.4.7",
+		"node-sql-parser": "^5.3.6",
 		"openai": "^4.85.4",
+		"typescript-parsec": "^0.3.4",
 		"zod": "^3.24.2"
 	}
 }
