@@ -4,7 +4,6 @@
     "": {
       "name": "db-mapping-generator",
       "dependencies": {
-        "@datastructures-js/priority-queue": "^6.3.2",
         "dotenv": "^16.4.7",
         "node-sql-parser": "^5.3.6",
         "openai": "^4.85.4",
@@ -20,10 +19,6 @@
     },
   },
   "packages": {
-    "@datastructures-js/heap": ["@datastructures-js/heap@4.3.3", "", {}, "sha512-UcUu/DLh/aM4W3C8zZfwxxm6/6FIZUlm3mcAXuNOCa6Aj4iizNvNXQyb8DjZQH2jKSQbMRyNlngP6TPimuGjpQ=="],
-
-    "@datastructures-js/priority-queue": ["@datastructures-js/priority-queue@6.3.2", "", { "dependencies": { "@datastructures-js/heap": "^4.3.3" } }, "sha512-hPmWlbmYRegOkZsWJuOzZw+BYcrOJ9B5xwy8Sz/QtEtLUPHtJbX9OpPpCB+KQPgOVb1QonqFqiddVDud/i5afw=="],
-
     "@types/bun": ["@types/bun@1.2.4", "", { "dependencies": { "bun-types": "1.2.4" } }, "sha512-QtuV5OMR8/rdKJs213iwXDpfVvnskPXY/S0ZiFbsTjQZycuqPbMW8Gf/XhLfwE5njW8sxI2WjISURXPlHypMFA=="],
 
     "@types/node": ["@types/node@18.19.76", "", { "dependencies": { "undici-types": "~5.26.4" } }, "sha512-yvR7Q9LdPz2vGpmpJX5LolrgRdWvB67MJKDPSgIIzpFbaf9a1j/f5DnLp5VDyHGMR0QZHlTr1afsD87QCXFHKw=="],
