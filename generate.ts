@@ -174,7 +174,8 @@ function getAllPreviousMappingsSection(
 
 function buildTargetTablesSection(
 	outDb: Database,
-	tableKeys: string[]
+	tableKeys: string[],
+	excludeIdFields = false
 ): string {
 	let section = ""
 	for (const tableKey of tableKeys) {
@@ -182,12 +183,44 @@ function buildTargetTablesSection(
 		if (!table) {
 			throw new Error(`Table ${tableKey} not found in outDb`)
 		}
+
+		// Identify PK columns
+		const pkColumns = new Set<string>()
+		for (const constraint of table.constraints) {
+			if (constraint.constraintType === "primaryKey") {
+				for (const col of constraint.columns) {
+					pkColumns.add(col)
+				}
+			}
+		}
+
+		// Identify FK columns
+		const fkColumns = new Set<string>()
+		for (const constraint of table.constraints) {
+			if (constraint.constraintType === "foreignKey") {
+				fkColumns.add(constraint.sourceColumn)
+			}
+		}
+
+		// Combine PK and FK columns to exclude
+		const excludeColumns = new Set([...pkColumns, ...fkColumns])
+
+		// Get the type map for the table
 		const typeMap = getDatabaseTablesTypeMap(outDb)[tableKey]
+
+		// Filter columns if excludeIdFields is true
+		const columnsToInclude = excludeIdFields
+			? Object.fromEntries(
+					Object.entries(typeMap).filter(([col]) => !excludeColumns.has(col))
+				)
+			: typeMap
+
 		const fkConstraints = table.constraints.filter(
 			(c): c is ForeignKeyConstraint => c.constraintType === "foreignKey"
 		)
+
 		section += `- ${tableKey}:\n  - Columns:\n`
-		for (const [col, type] of Object.entries(typeMap)) {
+		for (const [col, type] of Object.entries(columnsToInclude)) {
 			section += `    - ${col}: ${type}\n`
 		}
 		section += "  - Foreign Key Constraints:\n"
@@ -315,8 +348,8 @@ function generateMappingPromptForTable(
 	>
 ): string {
 	const allTableKeys = outDb.tables.map((t) => `${t.schema}.${t.name}`)
-	const allOutputTablesSection = `**All Output Tables:**\n${buildTargetTablesSection(outDb, allTableKeys)}`
-	const targetTableSection = `**Target Table to Map:**\n${buildTargetTablesSection(outDb, [targetTableKey])}`
+	const allOutputTablesSection = `**All Output Tables:**\n${buildTargetTablesSection(outDb, allTableKeys, false)}`
+	const targetTableSection = `**Target Table to Map:**\n${buildTargetTablesSection(outDb, [targetTableKey], true)}`
 	const relatedTablesSection = "**Related Tables for Context:** None.\n"
 	const allPreviousMappingsSection =
 		getAllPreviousMappingsSection(previousMappings)
