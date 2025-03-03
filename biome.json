@@ -7,7 +7,7 @@
 	},
 	"files": {
 		"ignoreUnknown": false,
-		"ignore": ["node_modules", ".next"]
+		"ignore": ["node_modules", ".next", "dist", "out"]
 	},
 	"formatter": {
 		"enabled": true,
@@ -21,8 +21,9 @@
 		"enabled": true,
 		"rules": {
 			"complexity": {
-				"noForEach": {
-					"level": "error"
+				"useOptionalChain": {
+					"level": "error",
+					"fix": "safe"
 				}
 			},
 			"suspicious": {

@@ -396,6 +396,7 @@ async function generateMappings(
 					response_format: { type: "json_object" }
 				})
 			)
+
 			const responseContent = completion.choices[0].message.content
 			if (!responseContent) {
 				console.error(`No content received for table: ${tableKey}`)

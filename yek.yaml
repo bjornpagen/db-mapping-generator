@@ -1,0 +1,6 @@
+# Add patterns to ignore (in addition to .gitignore)
+ignore_patterns:
+  - "yek.yaml"
+  - "bun.lock"
+  - "biome.json"
+  - "tsconfig.json"

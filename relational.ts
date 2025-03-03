@@ -1,30 +1,30 @@
 // Root database structure
 export interface Database {
-	type: "database";
-	dialect: "tsql" | "mysql";
-	tables: Table[];
+	type: "database"
+	dialect: "tsql" | "mysql"
+	tables: Table[]
 }
 
 // Table structure
 export interface Table {
-	type: "table";
-	name: string;
-	schema: string;
-	comment: string;
-	rawSql: string;
-	columns: Column[];
-	constraints: Constraint[];
-	fileGroup?: string;
+	type: "table"
+	name: string
+	schema: string
+	comment: string
+	rawSql: string
+	columns: Column[]
+	constraints: Constraint[]
+	fileGroup?: string
 }
 
 // Column structure
 export interface Column {
-	type: "column";
-	name: string;
-	dataType: string;
-	typeInfo: ColumnTypeInfo;
-	isNullable: boolean;
-	defaultValue?: string;
+	type: "column"
+	name: string
+	dataType: string
+	typeInfo: ColumnTypeInfo
+	isNullable: boolean
+	defaultValue?: string
 }
 
 // Type information for columns
@@ -40,7 +40,7 @@ export type ColumnTypeInfo =
 	| { kind: "text" }
 	| { kind: "simple" }
 	| { kind: "boolean" }
-	| { kind: "integer" };
+	| { kind: "integer" }
 
 // Constraint union type
 export type Constraint =
@@ -48,64 +48,64 @@ export type Constraint =
 	| ForeignKeyConstraint
 	| DefaultConstraint
 	| UniqueConstraint
-	| CheckConstraint;
+	| CheckConstraint
 
 // Primary Key constraint
 export interface PrimaryKeyConstraint {
-	type: "constraint";
-	constraintType: "primaryKey";
-	name: string;
-	columns: string[];
-	rawSql: string;
-	clustered?: boolean;
-	fileGroup?: string;
+	type: "constraint"
+	constraintType: "primaryKey"
+	name: string
+	columns: string[]
+	rawSql: string
+	clustered?: boolean
+	fileGroup?: string
 }
 
 // Foreign Key constraint
 export interface ForeignKeyConstraint {
-	type: "constraint";
-	constraintType: "foreignKey";
-	name: string;
-	sourceTable: string;
-	sourceSchema: string;
-	sourceColumn: string;
-	referencedTable: string;
-	referencedSchema: string;
-	referencedColumn: string;
-	rawSql: string;
+	type: "constraint"
+	constraintType: "foreignKey"
+	name: string
+	sourceTable: string
+	sourceSchema: string
+	sourceColumn: string
+	referencedTable: string
+	referencedSchema: string
+	referencedColumn: string
+	rawSql: string
 }
 
 // Default constraint
 export interface DefaultConstraint {
-	type: "constraint";
-	constraintType: "default";
-	name: string;
-	table: string;
-	schema: string;
-	column: string;
-	value: string;
-	rawSql: string;
+	type: "constraint"
+	constraintType: "default"
+	name: string
+	table: string
+	schema: string
+	column: string
+	value: string
+	rawSql: string
 }
 
 // Unique constraint
 export interface UniqueConstraint {
-	type: "constraint";
-	constraintType: "unique";
-	name: string;
-	table: string;
-	schema: string;
-	columns: string[];
-	clustered?: boolean;
-	rawSql: string;
+	type: "constraint"
+	constraintType: "unique"
+	name: string
+	table: string
+	schema: string
+	columns: string[]
+	clustered?: boolean
+	rawSql: string
 }
 
 // Check constraint
 export interface CheckConstraint {
-	type: "constraint";
-	constraintType: "check";
-	name: string;
-	table: string;
-	schema: string;
-	expression: string;
-	rawSql: string;
+	type: "constraint"
+	constraintType: "check"
+	name: string
+	table: string
+	schema: string
+	expression: string
+	rawSql: string
 }
