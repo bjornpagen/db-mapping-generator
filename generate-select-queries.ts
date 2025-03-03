@@ -17,7 +17,7 @@ async function loadMapping(filePath: string): Promise<Mapping> {
 		) {
 			throw new Error(`File not found: ${filePath}`)
 		}
-		throw readResult.error
+		throw Errors.wrap(readResult.error, "Failed to read mapping file")
 	}
 
 	try {
@@ -46,7 +46,7 @@ async function loadMapping(filePath: string): Promise<Mapping> {
 		return json as Mapping
 	} catch (error) {
 		if (error instanceof Error) {
-			throw error
+			throw Errors.wrap(error, "Failed to parse mapping file")
 		}
 		throw new Error(String(error))
 	}

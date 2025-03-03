@@ -33,23 +33,23 @@ async function readJsonFile(filePath: string): Promise<Database> {
 		fs.readFile(path.resolve(filePath), "utf-8")
 	)
 	if (contentResult.error) {
-		throw new Error(
-			`Failed to read file ${filePath}: ${contentResult.error.message}`
-		)
+		throw Errors.wrap(contentResult.error, `Failed to read file ${filePath}`)
 	}
 	const content = contentResult.data
 	const parseResult = Errors.trySync(() => JSON.parse(content))
 	if (parseResult.error) {
-		throw new Error(
-			`Failed to parse JSON from ${filePath}: ${parseResult.error.message}`
+		throw Errors.wrap(
+			parseResult.error,
+			`Failed to parse JSON from ${filePath}`
 		)
 	}
 	const parsedJson = parseResult.data
 	const database = parsedJson.database || (parsedJson as Database)
 	const validateResult = Errors.trySync(() => validateDatabase(database))
 	if (validateResult.error) {
-		throw new Error(
-			`Invalid database structure in ${filePath}: ${validateResult.error.message}`
+		throw Errors.wrap(
+			validateResult.error,
+			`Invalid database structure in ${filePath}`
 		)
 	}
 	return database
@@ -222,8 +222,8 @@ const mappingInstructions = `
   - Identify **one** target column in the 'All Output Tables' section that best matches its semantic meaning, aligning with the TMForum SID data model (e.g., 'dbo.User.Account' might map to 'mysql.party.ID').
   - Provide the source as '<schema>.<table>.<column>' (e.g., 'dbo.User.Account').
   - Provide the destination as '<schema>.<table>.<column>' (e.g., 'mysql.party.ID').
-  - If no suitable target column exists, set 'destination' to an empty string and explain in 'description' why it’s unmapped (e.g., not relevant to SID schema).
-  - In 'description', provide a complete English explanation of how the source column maps to the target column or why it doesn’t map, including any necessary transformations (e.g., type conversion, concatenation).
+  - If no suitable target column exists, set 'destination' to an empty string and explain in 'description' why it's unmapped (e.g., not relevant to SID schema).
+  - In 'description', provide a complete English explanation of how the source column maps to the target column or why it doesn't map, including any necessary transformations (e.g., type conversion, concatenation).
 - Respect data types and constraints (e.g., 'NOT NULL'); mention any necessary type conversions in the description.
 - Avoid mapping ID fields (e.g., columns ending with 'ID') from the source to non-ID fields in the target unless semantically appropriate. IDs typically represent keys, not descriptive data.
 - Ensure that the 'description' is a plain English explanation and does not include any code or JavaScript expressions.
@@ -405,22 +405,20 @@ async function generateMappings(
 			}
 			const parseResult = Errors.trySync(() => JSON.parse(responseContent))
 			if (parseResult.error) {
-				console.error(
-					`Error parsing JSON for table ${tableKey}:`,
-					parseResult.error
+				throw Errors.wrap(
+					parseResult.error,
+					`Error parsing JSON for table ${tableKey}`
 				)
-				return []
 			}
 			const jsonResponse = parseResult.data
 			const validateResult = Errors.trySync(() =>
 				MappingsSchema.parse(jsonResponse)
 			)
 			if (validateResult.error) {
-				console.error(
-					`Error validating mappings for table ${tableKey}:`,
-					validateResult.error
+				throw Errors.wrap(
+					validateResult.error,
+					`Error validating mappings for table ${tableKey}`
 				)
-				return []
 			}
 			const mappings = validateResult.data.mappings
 			const columnMappings: ColumnMapping[] = []
@@ -449,7 +447,11 @@ async function generateMappings(
 			}
 			return columnMappings
 		} catch (error) {
-			console.error(`Error processing table ${tableKey}:`, error)
+			if (error instanceof Error) {
+				console.error(`Error processing table ${tableKey}:`, error.message)
+			} else {
+				console.error(`Error processing table ${tableKey}:`, error)
+			}
 			return []
 		}
 	})
