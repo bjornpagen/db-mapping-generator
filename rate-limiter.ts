@@ -1,5 +1,5 @@
 import { RateLimitError } from "openai"
-import { tryCatch } from "./try-catch"
+import { tryCatch } from "./errors"
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms))

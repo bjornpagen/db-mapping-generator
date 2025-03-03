@@ -6,9 +6,8 @@ import type { Mapping, ColumnMapping } from "./mapping"
 import dotenv from "dotenv"
 import OpenAI from "openai"
 import { z } from "zod"
-import { tryCatch, trySync } from "./try-catch"
 import { retryWithExponentialBackoff } from "./rate-limiter"
-
+import { Errors } from "./errors"
 dotenv.config()
 
 if (!process.env.OPENAI_API_KEY) {
@@ -20,8 +19,8 @@ const openai = new OpenAI({
 	apiKey: process.env.OPENAI_API_KEY
 })
 
-const IN_DATABASE_PATH = "logisense.tsql.json"
-const OUT_DATABASE_PATH = "sid.mysql.json"
+const IN_DATABASE_PATH = "dumps/logisense.tsql.json"
+const OUT_DATABASE_PATH = "dumps/sid.mysql.json"
 
 // Configuration interface with a single array of source tables
 interface MappingConfig {
@@ -30,7 +29,7 @@ interface MappingConfig {
 }
 
 async function readJsonFile(filePath: string): Promise<Database> {
-	const contentResult = await tryCatch(
+	const contentResult = await Errors.try(
 		fs.readFile(path.resolve(filePath), "utf-8")
 	)
 	if (contentResult.error) {
@@ -39,7 +38,7 @@ async function readJsonFile(filePath: string): Promise<Database> {
 		)
 	}
 	const content = contentResult.data
-	const parseResult = trySync(() => JSON.parse(content))
+	const parseResult = Errors.trySync(() => JSON.parse(content))
 	if (parseResult.error) {
 		throw new Error(
 			`Failed to parse JSON from ${filePath}: ${parseResult.error.message}`
@@ -47,7 +46,7 @@ async function readJsonFile(filePath: string): Promise<Database> {
 	}
 	const parsedJson = parseResult.data
 	const database = parsedJson.database || (parsedJson as Database)
-	const validateResult = trySync(() => validateDatabase(database))
+	const validateResult = Errors.trySync(() => validateDatabase(database))
 	if (validateResult.error) {
 		throw new Error(
 			`Invalid database structure in ${filePath}: ${validateResult.error.message}`
@@ -372,7 +371,9 @@ async function generateMappings(
 	const sourceTableKeys = config.inputTables
 	let debugStream: fsSync.WriteStream | undefined
 	if (process.env.DEBUG_OUTPUT) {
-		const streamResult = await tryCatch(fs.open(process.env.DEBUG_OUTPUT, "a"))
+		const streamResult = await Errors.try(
+			fs.open(process.env.DEBUG_OUTPUT, "a")
+		)
 		if (streamResult.error) {
 			console.error("Error opening debug stream:", streamResult.error.message)
 		} else {
@@ -402,7 +403,7 @@ async function generateMappings(
 				console.error(`No content received for table: ${tableKey}`)
 				return []
 			}
-			const parseResult = trySync(() => JSON.parse(responseContent))
+			const parseResult = Errors.trySync(() => JSON.parse(responseContent))
 			if (parseResult.error) {
 				console.error(
 					`Error parsing JSON for table ${tableKey}:`,
@@ -411,7 +412,9 @@ async function generateMappings(
 				return []
 			}
 			const jsonResponse = parseResult.data
-			const validateResult = trySync(() => MappingsSchema.parse(jsonResponse))
+			const validateResult = Errors.trySync(() =>
+				MappingsSchema.parse(jsonResponse)
+			)
 			if (validateResult.error) {
 				console.error(
 					`Error validating mappings for table ${tableKey}:`,
