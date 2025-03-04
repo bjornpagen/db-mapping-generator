@@ -21,7 +21,7 @@ const SQLExpressionSchema = z.object({
 		)
 })
 
-// Type definitions
+// Type definitions from previous steps
 type GroupedMappings = Record<string, Record<string, ColumnMapping[]>>
 type ResolvedMappings = Record<string, Record<string, string>>
 
@@ -233,30 +233,6 @@ export function buildDependencyGraph(
 	return graph
 }
 
-// Compute included tables based on target tables and their dependencies
-function getIncludedTables(
-	graph: Record<string, string[]>,
-	targetTables: Set<string>
-): Set<string> {
-	const included = new Set<string>()
-
-	function visit(table: string) {
-		if (included.has(table)) {
-			return
-		}
-		included.add(table)
-		for (const dependency of graph[table] || []) {
-			visit(dependency)
-		}
-	}
-
-	for (const table of targetTables) {
-		visit(table)
-	}
-
-	return included
-}
-
 // Step 7: Sort the tables by dependencies and spot cycles
 export function topologicalSort(graph: Record<string, string[]>): {
 	order: string[]
@@ -338,7 +314,7 @@ function generateInsertStatements(
 	return inserts
 }
 
-// Handle Cycles in Dependencies
+// Step 7: Handle Cycles in Dependencies
 
 /**
  * Identifies foreign keys to set to NULL during INSERT to break cycles, based on topological order.
@@ -374,8 +350,8 @@ function getForeignKeysToSetNull(
  * Tracks which FKs need subsequent updates to their correct placeholder values.
  * @param resolvedMappings Mappings with placeholders for PKs and FKs from prior steps.
  * @param primaryKeyStatus Primary key status for each table.
- * @param tables The output tables from the Mapping object, filtered to included tables.
- * @param topologicalOrder The filtered order of tables, possibly imperfect due to cycles.
+ * @param tables The output tables from the Mapping object.
+ * @param topologicalOrder The order of tables, possibly imperfect due to cycles.
  * @returns An object with INSERT statements and a record of columns needing updates.
  */
 function generateInsertStatementsWithCycles(
@@ -393,7 +369,7 @@ function generateInsertStatementsWithCycles(
 			(t) => t.schema === schema && t.name === tableName
 		)
 		if (!table) {
-			throw new Error(`Table ${tableKey} not found in filtered tables`)
+			throw new Error(`Table ${tableKey} not found`)
 		}
 
 		const tableMappings = resolvedMappings[tableKey] || {}
@@ -491,75 +467,37 @@ function generateUpdateStatements(
 	return updates
 }
 
-// Generate final SQL based on source tables
-async function generateFinalSql(
-	mapping: Mapping,
-	sourceTables: string[]
-): Promise<string> {
-	// Identify target tables based on source tables
-	const targetTables = new Set<string>()
-	for (const srcTableFull of sourceTables) {
-		const parts = srcTableFull.split(".")
-		if (parts.length !== 2) {
-			console.warn(
-				`Invalid source table format: ${srcTableFull}. Expected schema.table`
-			)
-			continue
-		}
-		const [srcSchema, srcTable] = parts
-		for (const cm of mapping.columnMappings) {
-			if (cm.sourceSchema === srcSchema && cm.sourceTable === srcTable) {
-				const destTableKey = `${cm.destinationSchema}.${cm.destinationTable}`
-				targetTables.add(destTableKey)
-			}
-		}
-	}
+// Step 8: Tie It All Together in generateFinalSql
+async function generateFinalSql(mapping: Mapping): Promise<string> {
+	// Step 2: Group mappings, excluding PKs and FKs
+	const grouped = groupMappingsByDestination(mapping)
 
-	// Compute included tables using dependency graph
-	const graph = buildDependencyGraph(mapping)
-	const includedTables = getIncludedTables(graph, targetTables)
-
-	// Filter column mappings to only include those for included tables
-	const filteredColumnMappings = mapping.columnMappings.filter((cm) => {
-		const tableKey = `${cm.destinationSchema}.${cm.destinationTable}`
-		return includedTables.has(tableKey)
-	})
-
-	// Create filtered mapping
-	const filteredMapping: Mapping = {
-		...mapping,
-		columnMappings: filteredColumnMappings
-	}
-
-	// Proceed with existing logic using filtered mapping
-	const grouped = groupMappingsByDestination(filteredMapping)
-	const resolvedResult = await Errors.try(
-		resolveMappings(grouped, filteredMapping)
-	)
+	// Steps 3 & 4: Resolve mappings with PKs and FKs using placeholders
+	const resolvedResult = await Errors.try(resolveMappings(grouped, mapping))
 	if (resolvedResult.error) {
 		throw Errors.wrap(resolvedResult.error, "Failed to resolve mappings")
 	}
 	const resolvedMappings = resolvedResult.data
 
+	// Step 5: Get primary key status for all tables
 	const primaryKeyStatus = getPrimaryKeyMappingStatus(mapping, grouped)
-	const { order: topologicalOrder, hasCycles } = topologicalSort(graph)
 
-	// Filter topological order to only include tables in includedTables
-	const filteredTopologicalOrder = topologicalOrder.filter((table) =>
-		includedTables.has(table)
-	)
+	// Step 6: Build dependency graph based on FK relationships
+	const graph = buildDependencyGraph(mapping)
+
+	// Step 7: Determine insertion order and detect cycles
+	const { order: topologicalOrder, hasCycles } = topologicalSort(graph)
 
 	let sqlStatements: string[] = []
 
 	if (hasCycles) {
+		// Handle cycles (Step 7 continuation)
 		const cycleResult = Errors.trySync(() =>
 			generateInsertStatementsWithCycles(
 				resolvedMappings,
 				primaryKeyStatus,
-				mapping.out.tables.filter((table) =>
-					includedTables.has(`${table.schema}.${table.name}`)
-				),
-				filteredTopologicalOrder
+				mapping.out.tables,
+				topologicalOrder
 			)
 		)
 		if (cycleResult.error) {
@@ -579,6 +517,7 @@ async function generateFinalSql(
 			throw Errors.wrap(updatesResult.error, "Failed to generate updates")
 		}
 
+		// Wrap in transaction and disable FK checks for cycles
 		sqlStatements = [
 			"SET FOREIGN_KEY_CHECKS = 0;",
 			"START TRANSACTION;",
@@ -588,11 +527,12 @@ async function generateFinalSql(
 			"SET FOREIGN_KEY_CHECKS = 1;"
 		]
 	} else {
+		// No cycles, generate inserts in topological order
 		const insertsResult = Errors.trySync(() =>
 			generateInsertStatements(
 				resolvedMappings,
 				primaryKeyStatus,
-				filteredTopologicalOrder
+				topologicalOrder
 			)
 		)
 		if (insertsResult.error) {
@@ -601,6 +541,7 @@ async function generateFinalSql(
 		sqlStatements = insertsResult.data
 	}
 
+	// Return final SQL script as a single string
 	return sqlStatements.join("\n")
 }
 
@@ -624,22 +565,18 @@ async function loadMapping(filePath: string): Promise<Mapping> {
 	return result.data
 }
 
-// Main function to accept source tables
+// Main function to execute the process
 async function main() {
 	console.log("Starting insert query generation process")
 
 	const mappingFilePath = process.argv[2]
-	const sourceTables = process.argv.slice(3)
-
-	// Validate inputs
-	if (!mappingFilePath || sourceTables.length === 0) {
-		console.error(
-			"Usage: bun run query-generator.ts <mapping-file-path> <source-table1> <source-table2> ..."
-		)
+	if (!mappingFilePath) {
+		console.error("Usage: bun run query-generator.ts <mapping-file-path>")
 		process.exit(1)
 	}
 
 	console.log(`Loading mapping from file: ${mappingFilePath}`)
+
 	const mappingResult = await Errors.try(loadMapping(mappingFilePath))
 	if (mappingResult.error) {
 		console.error("Error:", mappingResult.error.toString())
@@ -650,8 +587,9 @@ async function main() {
 		`Successfully loaded mapping with ${mapping.columnMappings.length} column mappings`
 	)
 
-	console.log("Generating insert queries for source tables:", sourceTables)
-	const sqlResult = await Errors.try(generateFinalSql(mapping, sourceTables))
+	console.log("Generating insert queries...")
+
+	const sqlResult = await Errors.try(generateFinalSql(mapping))
 	if (sqlResult.error) {
 		console.error("Error:", sqlResult.error.toString())
 		process.exit(1)
@@ -661,6 +599,7 @@ async function main() {
 
 	const outputFile = "insert_queries.sql"
 	console.log(`Writing SQL script to file: ${outputFile}`)
+
 	const writeResult = await Errors.try(fs.writeFile(outputFile, sqlScript))
 	if (writeResult.error) {
 		console.error("Error writing SQL file:", writeResult.error.toString())
