@@ -32,20 +32,20 @@ export function trySync<T, E extends Error = Error>(fn: () => T): Result<T, E> {
 	}
 }
 
-export class WrappedError extends Error {
-	cause: Error | null
+export class WrappedError<E extends Error = Error> extends Error {
+	cause: E
 
-	constructor(message: string, cause?: Error) {
+	constructor(message: string, cause: E) {
 		super(message)
 		this.name = "WrappedError"
-		this.cause = cause || null
+		this.cause = cause
 
 		if (Error.captureStackTrace) {
 			Error.captureStackTrace(this, WrappedError)
 		}
 	}
 
-	unwrap(): Error | null {
+	unwrap(): E {
 		return this.cause
 	}
 
@@ -57,7 +57,10 @@ export class WrappedError extends Error {
 	}
 }
 
-export function wrap<E extends Error>(cause: E, message: string): WrappedError {
+export function wrap<E extends Error>(
+	cause: E,
+	message: string
+): WrappedError<E> {
 	return new WrappedError(message, cause)
 }
 
