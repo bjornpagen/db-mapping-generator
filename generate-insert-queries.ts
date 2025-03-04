@@ -285,12 +285,48 @@ function getInsertionOrder(database: Database): {
 	return { nonCycleTables, cycleTables: Array.from(cycleTables) }
 }
 
-// Generates insert and update SQL strings with named placeholders
+// Union-Find structure for canonicalizing IDs
+class UnionFind {
+	parent: Record<string, string>
+	rank: Record<string, number>
+
+	constructor() {
+		this.parent = {}
+		this.rank = {}
+	}
+
+	find(x: string): string {
+		if (this.parent[x] === undefined) {
+			this.parent[x] = x
+			this.rank[x] = 0
+		}
+		if (this.parent[x] !== x) {
+			this.parent[x] = this.find(this.parent[x])
+		}
+		return this.parent[x]
+	}
+
+	union(x: string, y: string) {
+		const rootX = this.find(x)
+		const rootY = this.find(y)
+		if (rootX !== rootY) {
+			if (this.rank[rootX] > this.rank[rootY]) {
+				this.parent[rootY] = rootX
+			} else if (this.rank[rootX] < this.rank[rootY]) {
+				this.parent[rootX] = rootY
+			} else {
+				this.parent[rootY] = rootX
+				this.rank[rootX]++
+			}
+		}
+	}
+}
+
+// Generates insert SQL strings with named placeholders, canonicalizing IDs
 export async function generateInsertQueries(mapping: Mapping): Promise<{
 	nonCycleInserts: { tableKey: string; sourceKey: string; sql: string }[]
 	cycleTransaction: {
 		inserts: { tableKey: string; sourceKey: string; sql: string }[]
-		updates: { tableKey: string; sourceKey: string; sql: string }[]
 	}
 	warnings: string[]
 }> {
@@ -298,38 +334,58 @@ export async function generateInsertQueries(mapping: Mapping): Promise<{
 		`Starting insert query generation for mapping with ${mapping.columnMappings.length} column mappings`
 	)
 
+	const sourceDb = mapping.in
 	const targetDb = mapping.out
 	if (targetDb.dialect !== "mysql") {
 		throw new Error("Target database must be MySQL.")
 	}
 	const groupedMappings = groupMappingsByTargetTable(mapping)
 	const { nonCycleTables, cycleTables } = getInsertionOrder(targetDb)
-	const cycleTablesSet = new Set(cycleTables)
 	const warnings: string[] = []
 
-	// Collect warnings for non-nullable cycle FKs
-	for (const tableKey of cycleTables) {
-		const tableDef = targetDb.tables.find(
-			(t) => `${t.schema}.${t.name}` === tableKey
-		)
-		if (!tableDef) {
-			continue
+	// Build union-find structure for source columns based on foreign key relationships
+	const uf = new UnionFind()
+	const columnToTable: Record<string, string> = {}
+	for (const table of sourceDb.tables) {
+		const tableKey = `${table.schema}.${table.name}`
+		for (const column of table.columns) {
+			const columnKey = `${table.schema}.${table.name}.${column.name}`
+			uf.find(columnKey) // Initialize node in union-find
+			columnToTable[columnKey] = tableKey
 		}
-		const cycleFKColumns = tableDef.columns.filter((col) => {
-			const fk = tableDef.constraints.find(
-				(c) => c.constraintType === "foreignKey" && c.sourceColumn === col.name
-			) as ForeignKeyConstraint | undefined
-			return (
-				fk && cycleTablesSet.has(`${fk.referencedSchema}.${fk.referencedTable}`)
+		const fkConstraints = table.constraints.filter(
+			(c): c is ForeignKeyConstraint => c.constraintType === "foreignKey"
+		)
+		for (const fk of fkConstraints) {
+			const sourceColumnKey = `${fk.sourceSchema}.${fk.sourceTable}.${fk.sourceColumn}`
+			const referencedColumnKey = `${fk.referencedSchema}.${fk.referencedTable}.${fk.referencedColumn}`
+			uf.union(sourceColumnKey, referencedColumnKey) // Merge FK and PK
+		}
+	}
+
+	// Determine canonical representatives (prefer primary keys)
+	const canonicalMap: Record<string, string> = {}
+	for (const columnKey of Object.keys(uf.parent)) {
+		const root = uf.find(columnKey)
+		if (canonicalMap[root] === undefined) {
+			const tableKey = columnToTable[columnKey]
+			const table = sourceDb.tables.find(
+				(t) => `${t.schema}.${t.name}` === tableKey
 			)
-		})
-		for (const col of cycleFKColumns) {
-			if (!col.isNullable) {
-				const warning = `Non-nullable cycle FK ${tableKey}.${col.name} will be set to NULL initially and updated later. Ensure this is acceptable.`
-				console.log(`WARNING: ${warning}`)
-				warnings.push(warning)
+			if (table) {
+				const pkColumn = getPrimaryKeyColumn(table)
+				if (pkColumn) {
+					const pkColumnKey = `${table.schema}.${table.name}.${pkColumn}`
+					if (uf.find(pkColumnKey) === root) {
+						canonicalMap[root] = pkColumnKey // Use PK as canonical if in the same set
+					}
+				}
+			}
+			if (canonicalMap[root] === undefined) {
+				canonicalMap[root] = columnKey // Default to first column if no PK
 			}
 		}
+		canonicalMap[columnKey] = canonicalMap[root]
 	}
 
 	// Non-cycle inserts
@@ -356,7 +412,13 @@ export async function generateInsertQueries(mapping: Mapping): Promise<{
 		}
 
 		const pkColumn = getPrimaryKeyColumn(tableDef)
+		if (!pkColumn) {
+			warnings.push(`No primary key found for ${tableKey}, skipping`)
+			continue
+		}
+
 		const fkColumns = getForeignKeyColumns(tableDef)
+		const excludeColumns = new Set([pkColumn, ...fkColumns])
 
 		for (const group of mappingGroups) {
 			const sourceKey = `${group.sourceSchema}.${group.sourceTable}`
@@ -367,18 +429,12 @@ export async function generateInsertQueries(mapping: Mapping): Promise<{
 				continue
 			}
 
-			// Separate mappings
-			const pkMapping = mappings.find((cm) => cm.destinationColumn === pkColumn)
-			const fkMappings = mappings.filter((cm) =>
-				fkColumns.includes(cm.destinationColumn)
-			)
+			// Filter out PK and FK mappings
 			const otherMappings = mappings.filter(
-				(cm) =>
-					cm.destinationColumn !== pkColumn &&
-					!fkColumns.includes(cm.destinationColumn)
+				(cm) => !excludeColumns.has(cm.destinationColumn)
 			)
 
-			// Handle non-key columns for potential duplicates
+			// Handle non-key columns for duplicates
 			const mappingMap = new Map<string, ColumnMapping[]>()
 			for (const cm of otherMappings) {
 				if (!mappingMap.has(cm.destinationColumn)) {
@@ -417,21 +473,48 @@ export async function generateInsertQueries(mapping: Mapping): Promise<{
 				}
 			}
 
-			// Include primary key if mapped
-			if (pkMapping) {
-				resolvedMappings.push({
-					mapping: pkMapping,
-					value: `:${pkMapping.sourceSchema}.${pkMapping.sourceTable}.${pkMapping.sourceColumn}`
-				})
-			}
+			// Include new PK
+			resolvedMappings.push({
+				mapping: {
+					sourceSchema: "",
+					sourceTable: "",
+					sourceColumn: "",
+					destinationSchema: tableDef.schema,
+					destinationTable: tableDef.name,
+					destinationColumn: pkColumn,
+					description: "New primary key"
+				},
+				value: ":new_pk"
+			})
 
-			// Include foreign keys if mapped
-			for (const fkMapping of fkMappings) {
-				if (!cycleTablesSet.has(tableKey)) {
-					resolvedMappings.push({
-						mapping: fkMapping,
-						value: `:${fkMapping.sourceSchema}.${fkMapping.sourceTable}.${fkMapping.sourceColumn}`
-					})
+			// Include FKs with canonicalized placeholders if there is a mapping
+			for (const fkColumn of fkColumns) {
+				const fkMapping = mappings.find(
+					(cm) => cm.destinationColumn === fkColumn
+				)
+				if (fkMapping) {
+					const sourceColumnKey = `${fkMapping.sourceSchema}.${fkMapping.sourceTable}.${fkMapping.sourceColumn}`
+					const canonicalColumn = canonicalMap[sourceColumnKey]
+					if (canonicalColumn) {
+						resolvedMappings.push({
+							mapping: fkMapping,
+							value: `:mapped_${canonicalColumn}`
+						})
+					} else {
+						warnings.push(
+							`No canonical column found for ${sourceColumnKey}, using original`
+						)
+						resolvedMappings.push({
+							mapping: fkMapping,
+							value: `:mapped_${fkMapping.sourceSchema}.${fkMapping.sourceTable}.${fkMapping.sourceColumn}`
+						})
+					}
+				} else if (
+					!tableDef.columns.find((col) => col.name === fkColumn)?.isNullable
+				) {
+					warnings.push(
+						`No mapping for non-nullable FK ${tableKey}.${fkColumn}, it will be NULL`
+					)
 				}
 			}
 
@@ -451,10 +534,8 @@ export async function generateInsertQueries(mapping: Mapping): Promise<{
 		}
 	}
 
-	// Cycle inserts and updates
+	// Cycle inserts (similar logic)
 	const cycleInserts: { tableKey: string; sourceKey: string; sql: string }[] =
-		[]
-	const cycleUpdates: { tableKey: string; sourceKey: string; sql: string }[] =
 		[]
 	for (const tableKey of cycleTables) {
 		console.log(`Processing cycle table: ${tableKey}`)
@@ -474,19 +555,13 @@ export async function generateInsertQueries(mapping: Mapping): Promise<{
 		}
 
 		const pkColumn = getPrimaryKeyColumn(tableDef)
+		if (!pkColumn) {
+			warnings.push(`No primary key found for ${tableKey}, skipping`)
+			continue
+		}
+
 		const fkColumns = getForeignKeyColumns(tableDef)
-		const cycleFKColumns = tableDef.columns
-			.filter((col) => {
-				const fk = tableDef.constraints.find(
-					(c) =>
-						c.constraintType === "foreignKey" && c.sourceColumn === col.name
-				) as ForeignKeyConstraint | undefined
-				return (
-					fk &&
-					cycleTablesSet.has(`${fk.referencedSchema}.${fk.referencedTable}`)
-				)
-			})
-			.map((col) => col.name)
+		const excludeColumns = new Set([pkColumn, ...fkColumns])
 
 		for (const group of mappingGroups) {
 			const sourceKey = `${group.sourceSchema}.${group.sourceTable}`
@@ -497,18 +572,12 @@ export async function generateInsertQueries(mapping: Mapping): Promise<{
 				continue
 			}
 
-			// Separate mappings
-			const pkMapping = mappings.find((cm) => cm.destinationColumn === pkColumn)
-			const fkMappings = mappings.filter((cm) =>
-				fkColumns.includes(cm.destinationColumn)
-			)
+			// Filter out PK and FK mappings
 			const otherMappings = mappings.filter(
-				(cm) =>
-					cm.destinationColumn !== pkColumn &&
-					!fkColumns.includes(cm.destinationColumn)
+				(cm) => !excludeColumns.has(cm.destinationColumn)
 			)
 
-			// Handle non-key columns for potential duplicates
+			// Handle non-key columns for duplicates
 			const mappingMap = new Map<string, ColumnMapping[]>()
 			for (const cm of otherMappings) {
 				if (!mappingMap.has(cm.destinationColumn)) {
@@ -547,59 +616,74 @@ export async function generateInsertQueries(mapping: Mapping): Promise<{
 				}
 			}
 
-			// Include primary key if mapped
-			if (pkMapping) {
-				resolvedMappings.push({
-					mapping: pkMapping,
-					value: `:${pkMapping.sourceSchema}.${pkMapping.sourceTable}.${pkMapping.sourceColumn}`
-				})
+			// Include new PK
+			resolvedMappings.push({
+				mapping: {
+					sourceSchema: "",
+					sourceTable: "",
+					sourceColumn: "",
+					destinationSchema: tableDef.schema,
+					destinationTable: tableDef.name,
+					destinationColumn: pkColumn,
+					description: "New primary key"
+				},
+				value: ":new_pk"
+			})
+
+			// Include FKs with canonicalized placeholders if there is a mapping
+			for (const fkColumn of fkColumns) {
+				const fkMapping = mappings.find(
+					(cm) => cm.destinationColumn === fkColumn
+				)
+				if (fkMapping) {
+					const sourceColumnKey = `${fkMapping.sourceSchema}.${fkMapping.sourceTable}.${fkMapping.sourceColumn}`
+					const canonicalColumn = canonicalMap[sourceColumnKey]
+					if (canonicalColumn) {
+						resolvedMappings.push({
+							mapping: fkMapping,
+							value: `:mapped_${canonicalColumn}`
+						})
+					} else {
+						warnings.push(
+							`No canonical column found for ${sourceColumnKey}, using original`
+						)
+						resolvedMappings.push({
+							mapping: fkMapping,
+							value: `:mapped_${fkMapping.sourceSchema}.${fkMapping.sourceTable}.${fkMapping.sourceColumn}`
+						})
+					}
+				} else if (
+					!tableDef.columns.find((col) => col.name === fkColumn)?.isNullable
+				) {
+					warnings.push(
+						`No mapping for non-nullable FK ${tableKey}.${fkColumn}, it will be NULL`
+					)
+				}
 			}
 
-			// Prepare insert with cycle FKs as NULL
-			const insertMappings = resolvedMappings.filter(
-				(item) => !cycleFKColumns.includes(item.mapping.destinationColumn)
-			)
-			const insertColumns = insertMappings.map((item) =>
+			if (resolvedMappings.length === 0) {
+				console.log(`  - No resolved mappings for ${sourceKey}, skipping`)
+				continue
+			}
+
+			const columns = resolvedMappings.map((item) =>
 				quoteIdentifier(item.mapping.destinationColumn)
 			)
-			const insertValues = insertMappings.map((item) => item.value)
-			const allColumns = insertColumns.concat(
-				cycleFKColumns.map(quoteIdentifier)
-			)
-			const allValues = insertValues.concat(cycleFKColumns.map(() => "NULL"))
+			const values = resolvedMappings.map((item) => item.value)
 			const tableFullName = `${quoteIdentifier(tableDef.schema)}.${quoteIdentifier(tableDef.name)}`
-			const insertSql = `INSERT INTO ${tableFullName} (${allColumns.join(", ")}) VALUES (${allValues.join(", ")})`
-			console.log(`  - Generated insert SQL for ${sourceKey}: ${insertSql}`)
-			cycleInserts.push({ tableKey, sourceKey, sql: insertSql })
-
-			// Generate updates for cycle FKs
-			if (pkColumn && pkMapping) {
-				const whereClause = `${quoteIdentifier(pkColumn)} = :${pkMapping.sourceSchema}.${pkMapping.sourceTable}.${pkMapping.sourceColumn}`
-				for (const cycleFK of cycleFKColumns) {
-					const fkMapping = fkMappings.find(
-						(cm) => cm.destinationColumn === cycleFK
-					)
-					if (fkMapping) {
-						const updateSql = `UPDATE ${tableFullName} SET ${quoteIdentifier(cycleFK)} = :${fkMapping.sourceSchema}.${fkMapping.sourceTable}.${fkMapping.sourceColumn} WHERE ${whereClause}`
-						console.log(`  - Generated update SQL for ${cycleFK}: ${updateSql}`)
-						cycleUpdates.push({ tableKey, sourceKey, sql: updateSql })
-					}
-				}
-			} else if (!pkMapping && pkColumn) {
-				warnings.push(
-					`No primary key mapping for ${tableKey}.${pkColumn} from ${sourceKey}; updates skipped for cycle FKs`
-				)
-			}
+			const sql = `INSERT INTO ${tableFullName} (${columns.join(", ")}) VALUES (${values.join(", ")})`
+			console.log(`  - Generated SQL for ${tableKey} from ${sourceKey}: ${sql}`)
+			cycleInserts.push({ tableKey, sourceKey, sql })
 		}
 	}
 
 	console.log(
-		`Query generation complete: ${nonCycleInserts.length} non-cycle inserts, ${cycleInserts.length} cycle inserts, ${cycleUpdates.length} updates, ${warnings.length} warnings`
+		`Query generation complete: ${nonCycleInserts.length} non-cycle inserts, ${cycleInserts.length} cycle inserts, ${warnings.length} warnings`
 	)
 
 	return {
 		nonCycleInserts,
-		cycleTransaction: { inserts: cycleInserts, updates: cycleUpdates },
+		cycleTransaction: { inserts: cycleInserts },
 		warnings
 	}
 }
@@ -609,7 +693,7 @@ function buildReport(
 	result: Awaited<ReturnType<typeof generateInsertQueries>>
 ): string {
 	console.log(
-		`Building report with ${result.nonCycleInserts.length} non-cycle inserts, ${result.cycleTransaction.inserts.length} cycle inserts, ${result.cycleTransaction.updates.length} updates`
+		`Building report with ${result.nonCycleInserts.length} non-cycle inserts, ${result.cycleTransaction.inserts.length} cycle inserts`
 	)
 
 	let report = "Insert Queries Report\n\n"
@@ -632,19 +716,12 @@ function buildReport(
 		report += `   - ${sql}\n\n`
 	}
 
-	if (
-		result.cycleTransaction.inserts.length > 0 ||
-		result.cycleTransaction.updates.length > 0
-	) {
+	if (result.cycleTransaction.inserts.length > 0) {
 		report += "Cycle tables:\n\n"
 		report += "SET FOREIGN_KEY_CHECKS = 0;\n"
 		report += "START TRANSACTION;\n\n"
 		for (const { tableKey, sourceKey, sql } of result.cycleTransaction
 			.inserts) {
-			report += `   - ${sql}  -- ${tableKey} from ${sourceKey}\n`
-		}
-		for (const { tableKey, sourceKey, sql } of result.cycleTransaction
-			.updates) {
 			report += `   - ${sql}  -- ${tableKey} from ${sourceKey}\n`
 		}
 		report += "COMMIT;\n"
@@ -654,6 +731,10 @@ function buildReport(
 	report += "Notes:\n"
 	report +=
 		"- Placeholders like `:source_schema.source_table.source_column` should be replaced with actual values from the source database.\n"
+	report +=
+		"- Placeholders like `:new_pk` should be replaced with new UUIDs generated for primary keys.\n"
+	report +=
+		"- Placeholders like `:mapped_source_schema.source_table.source_column` (where the column is the canonical representative) should be replaced with the new PKs corresponding to the source values, ensuring all IDs in the same equivalence class (connected via foreign keys) use the same ID.\n"
 
 	console.log(`Report generated with ${report.length} characters`)
 	return report
