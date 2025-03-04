@@ -1,4 +1,6 @@
 import fs from "node:fs/promises"
+import OpenAI from "openai"
+import { z } from "zod"
 import type { ColumnMapping, Mapping } from "./mapping"
 import type {
 	ForeignKeyConstraint,
@@ -6,50 +8,91 @@ import type {
 	Table
 } from "./relational"
 import { Errors } from "./errors"
+import { zodResponseFormat } from "openai/helpers/zod"
+import { retryWithExponentialBackoff } from "./rate-limiter"
 
-// Step 1: Group mappings by destination table and column
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+
+const SQLExpressionSchema = z.object({
+	expression: z
+		.string()
+		.describe(
+			"The SQL expression that combines all the source columns into a single value"
+		)
+})
+
+// Type definitions from previous steps
 type GroupedMappings = Record<string, Record<string, ColumnMapping[]>>
+type ResolvedMappings = Record<string, Record<string, string>>
 
-/**
- * Groups column mappings by their destination table and column.
- * @param mapping The Mapping object containing columnMappings to organize.
- * @returns A nested structure where outer keys are "schema.table" and inner keys are columns,
- *          each mapping to an array of ColumnMapping objects.
- */
+// Step 1: Identify All Primary and Foreign Keys
+function identifyKeyColumns(mapping: Mapping): {
+	primaryKeys: Record<string, string>
+	foreignKeys: Record<string, string[]>
+} {
+	const primaryKeys: Record<string, string> = {}
+	const foreignKeys: Record<string, string[]> = {}
+
+	for (const table of mapping.out.tables) {
+		const tableKey = `${table.schema}.${table.name}`
+
+		const pkConstraint = table.constraints.find(
+			(c): c is PrimaryKeyConstraint => c.constraintType === "primaryKey"
+		)
+		if (pkConstraint && pkConstraint.columns.length === 1) {
+			primaryKeys[tableKey] = pkConstraint.columns[0]
+		} else {
+			throw new Error(`Table ${tableKey} must have a single-column primary key`)
+		}
+
+		foreignKeys[tableKey] = []
+		for (const constraint of table.constraints) {
+			if (constraint.constraintType === "foreignKey") {
+				const fkConstraint = constraint as ForeignKeyConstraint
+				foreignKeys[tableKey].push(fkConstraint.sourceColumn)
+			}
+		}
+	}
+
+	return { primaryKeys, foreignKeys }
+}
+
+// Step 2: Group mappings by destination table and column, excluding PK and FK mappings
 export function groupMappingsByDestination(mapping: Mapping): GroupedMappings {
+	const { primaryKeys, foreignKeys } = identifyKeyColumns(mapping)
 	const grouped: GroupedMappings = {}
 
 	for (const colMapping of mapping.columnMappings) {
 		const tableKey = `${colMapping.destinationSchema}.${colMapping.destinationTable}`
 		const columnName = colMapping.destinationColumn
 
+		const isPrimaryKey = primaryKeys[tableKey] === columnName
+		const isForeignKey = (foreignKeys[tableKey] || []).includes(columnName)
+		if (isPrimaryKey || isForeignKey) {
+			continue
+		}
+
 		if (!grouped[tableKey]) {
 			grouped[tableKey] = {}
 		}
-
 		if (!grouped[tableKey][columnName]) {
 			grouped[tableKey][columnName] = []
 		}
-
 		grouped[tableKey][columnName].push(colMapping)
 	}
 
 	return grouped
 }
 
-// Step 2: Resolve mappings into single SQL expressions
-type ResolvedMappings = Record<string, Record<string, string>>
-
-/**
- * Resolves duplicate mappings into a single SQL expression for each column.
- * For single mappings, uses the source column directly. For duplicates, combines them using a mock AI function.
- * @param grouped The grouped mappings from Step 1.
- * @returns A promise resolving to a structure with SQL expressions for each column in each table.
- */
+// Step 3 & 4: Resolve mappings into single SQL expressions, including PK and FK mapping with placeholders
 async function resolveMappings(
-	grouped: GroupedMappings
+	grouped: GroupedMappings,
+	mapping: Mapping
 ): Promise<ResolvedMappings> {
 	const resolved: ResolvedMappings = {}
+	const { primaryKeys } = identifyKeyColumns(mapping)
+	const pkPlaceholders = new Map<string, string>()
+	let placeholderCounter = 0
 
 	for (const tableKey in grouped) {
 		resolved[tableKey] = {}
@@ -69,35 +112,79 @@ async function resolveMappings(
 		}
 	}
 
+	for (const tableKey in primaryKeys) {
+		if (!resolved[tableKey]) {
+			resolved[tableKey] = {}
+		}
+		const pkColumn = primaryKeys[tableKey]
+		const placeholder = `:pk_placeholder_${placeholderCounter++}`
+		pkPlaceholders.set(tableKey, placeholder)
+		resolved[tableKey][pkColumn] = placeholder
+	}
+
+	for (const table of mapping.out.tables) {
+		const tableKey = `${table.schema}.${table.name}`
+		for (const constraint of table.constraints) {
+			if (constraint.constraintType === "foreignKey") {
+				const fkConstraint = constraint as ForeignKeyConstraint
+				const fkColumn = fkConstraint.sourceColumn
+				const refTableKey = `${fkConstraint.referencedSchema}.${fkConstraint.referencedTable}`
+				const refPlaceholder = pkPlaceholders.get(refTableKey)
+				if (!refPlaceholder) {
+					throw new Error(`No placeholder for referenced table ${refTableKey}`)
+				}
+				if (!resolved[tableKey]) {
+					resolved[tableKey] = {}
+				}
+				resolved[tableKey][fkColumn] = refPlaceholder
+			}
+		}
+	}
+
 	return resolved
 }
 
-/**
- * Mock function to simulate resolving duplicate mappings into a single SQL expression.
- * In a real scenario, this would call an AI service like OpenAI.
- * @param duplicates Array of ColumnMapping objects targeting the same destination column.
- * @returns A promise resolving to the combined SQL expression.
- */
+// Helper function to resolve duplicate mappings for non-key columns
 async function resolveDuplicateMapping(
 	duplicates: ColumnMapping[]
 ): Promise<string> {
-	const destColumn = duplicates[0].destinationColumn
-	if (destColumn === "validFor") {
-		return `CONCAT(:${duplicates[0].sourceSchema}.${duplicates[0].sourceTable}.${duplicates[0].sourceColumn}, ' to ', :${duplicates[1].sourceSchema}.${duplicates[1].sourceTable}.${duplicates[1].sourceColumn})`
-	}
-	if (destColumn === "name") {
-		return `COALESCE(:${duplicates[0].sourceSchema}.${duplicates[0].sourceTable}.${duplicates[0].sourceColumn}, :${duplicates[1].sourceSchema}.${duplicates[1].sourceTable}.${duplicates[1].sourceColumn})`
-	}
-	throw new Error(`No mock resolution defined for column ${destColumn}`)
+	console.log(
+		`Resolving duplicate mappings for ${duplicates[0].destinationColumn} with ${duplicates.length} source columns`
+	)
+
+	let prompt =
+		"Combine the following column mapping descriptions into a single SQL expression that produces the merged value. Use named placeholders. For each mapping, consider the source column and its description.\n"
+	duplicates.forEach((cm, index) => {
+		prompt += `${index + 1}. Source: ${cm.sourceSchema}.${cm.sourceTable}.${cm.sourceColumn}. Description: ${cm.description}\n`
+	})
+	prompt +=
+		"\nExample: For a mapping combining startDate and endDate into validFor, a valid output would be CONCAT(:dbo.Package.StartDate, ' to ', :dbo.Package.EndDate).\n"
+	prompt += "Return only the SQL expression."
+
+	console.log(
+		`Sending prompt to OpenAI to resolve ${duplicates.length} duplicates for ${duplicates[0].destinationColumn}`
+	)
+
+	const result = await retryWithExponentialBackoff(async () => {
+		const completionResult = await openai.beta.chat.completions.parse({
+			model: "o3-mini",
+			messages: [{ role: "user", content: prompt }],
+			response_format: zodResponseFormat(SQLExpressionSchema, "sql")
+		})
+
+		const parsed = completionResult.choices[0].message.parsed
+		if (!parsed) {
+			throw new Error("OpenAI did not return a valid structured response")
+		}
+
+		return parsed.expression
+	})
+
+	console.log(`Successfully resolved duplicate mapping: ${result}`)
+	return result
 }
 
-// Step 3: Identify each table's primary key and check if it's mapped
-/**
- * Identifies the primary key for each table in the output database and checks if it is mapped.
- * @param mapping The Mapping object containing the output database tables.
- * @param grouped The grouped mappings from Step 1.
- * @returns A record where each key is "schema.table" and the value contains the primary key column name and a boolean indicating if it is mapped.
- */
+// Step 5: Identify each table's primary key and check if it's mapped
 export function getPrimaryKeyMappingStatus(
 	mapping: Mapping,
 	grouped: GroupedMappings
@@ -124,12 +211,7 @@ export function getPrimaryKeyMappingStatus(
 	return status
 }
 
-// Step 4: Build a dependency graph based on foreign keys
-/**
- * Builds a dependency graph based on foreign key constraints in the output database.
- * @param mapping The Mapping object containing the output database tables.
- * @returns A record where each key is "schema.table" and the value is an array of tables it depends on.
- */
+// Step 6: Build a dependency graph based on foreign keys
 export function buildDependencyGraph(
 	mapping: Mapping
 ): Record<string, string[]> {
@@ -151,12 +233,7 @@ export function buildDependencyGraph(
 	return graph
 }
 
-// Step 5: Sort the tables by dependencies and spot cycles
-/**
- * Performs a topological sort on the dependency graph and detects cycles.
- * @param graph The dependency graph from Step 4.
- * @returns An object with the topological order and a boolean indicating if cycles exist.
- */
+// Step 7: Sort the tables by dependencies and spot cycles
 export function topologicalSort(graph: Record<string, string[]>): {
 	order: string[]
 	hasCycles: boolean
@@ -192,14 +269,7 @@ export function topologicalSort(graph: Record<string, string[]>): {
 	return { order: order.reverse(), hasCycles }
 }
 
-// Step 6: Generate Insert Statements for Non-Cyclic Tables
-/**
- * Generates MySQL INSERT statements for non-cyclic tables in topological order.
- * @param resolvedMappings Resolved mappings from Step 2.
- * @param primaryKeyStatus Primary key status from Step 3.
- * @param topologicalOrder Topological order from Step 5.
- * @returns An array of MySQL INSERT statements.
- */
+// Step 8: Generate Insert Statements for Non-Cyclic Tables
 function generateInsertStatements(
 	resolvedMappings: ResolvedMappings,
 	primaryKeyStatus: Record<string, { primaryKey: string; isMapped: boolean }>,
@@ -218,13 +288,18 @@ function generateInsertStatements(
 		const columnsToInsert: string[] = []
 		const values: string[] = []
 
-		if (pkInfo.isMapped && tableMappings[pkInfo.primaryKey]) {
-			columnsToInsert.push(pkInfo.primaryKey)
-			values.push(tableMappings[pkInfo.primaryKey])
+		const pkColumn = pkInfo.primaryKey
+		if (tableMappings[pkColumn]) {
+			columnsToInsert.push(pkColumn)
+			values.push(tableMappings[pkColumn])
+		} else {
+			throw new Error(
+				`No mapping for primary key ${pkColumn} in table ${tableKey}`
+			)
 		}
 
 		for (const column in tableMappings) {
-			if (column !== pkInfo.primaryKey) {
+			if (column !== pkColumn) {
 				columnsToInsert.push(column)
 				values.push(tableMappings[column])
 			}
@@ -239,12 +314,14 @@ function generateInsertStatements(
 	return inserts
 }
 
-// Step 7: Handle Cycles (Helper Functions)
+// Step 7: Handle Cycles in Dependencies
+
 /**
- * Identifies foreign keys to set to NULL during INSERT based on topological order.
- * @param table The table to analyze.
- * @param topologicalOrder The order of tables.
- * @returns Array of column names to set to NULL.
+ * Identifies foreign keys to set to NULL during INSERT to break cycles, based on topological order.
+ * If a referenced table appears after the current table in the order, its FK is set to NULL.
+ * @param table The table to analyze for foreign key constraints.
+ * @param topologicalOrder The order of tables from topological sort.
+ * @returns Array of foreign key column names to set to NULL during insertion.
  */
 function getForeignKeysToSetNull(
 	table: Table,
@@ -269,12 +346,13 @@ function getForeignKeysToSetNull(
 }
 
 /**
- * Generates INSERT statements for tables with cycles, setting some foreign keys to NULL.
- * @param resolvedMappings Resolved mappings from Step 2.
- * @param primaryKeyStatus Primary key status from Step 3.
- * @param tables Output tables from the Mapping.
- * @param topologicalOrder Topological order from Step 5.
- * @returns INSERT statements and columns needing updates.
+ * Generates INSERT statements for tables, handling cycles by setting conflicting FKs to NULL.
+ * Tracks which FKs need subsequent updates to their correct placeholder values.
+ * @param resolvedMappings Mappings with placeholders for PKs and FKs from prior steps.
+ * @param primaryKeyStatus Primary key status for each table.
+ * @param tables The output tables from the Mapping object.
+ * @param topologicalOrder The order of tables, possibly imperfect due to cycles.
+ * @returns An object with INSERT statements and a record of columns needing updates.
  */
 function generateInsertStatementsWithCycles(
 	resolvedMappings: ResolvedMappings,
@@ -303,13 +381,16 @@ function generateInsertStatementsWithCycles(
 		const columnsToInsert: string[] = []
 		const values: string[] = []
 
-		if (pkInfo.isMapped && tableMappings[pkInfo.primaryKey]) {
+		// Include primary key with its placeholder
+		if (tableMappings[pkInfo.primaryKey]) {
 			columnsToInsert.push(pkInfo.primaryKey)
 			values.push(tableMappings[pkInfo.primaryKey])
 		}
 
+		// Identify FKs to set to NULL due to cycles
 		const fkToSetNull = getForeignKeysToSetNull(table, topologicalOrder)
 
+		// Process all mapped columns
 		for (const column in tableMappings) {
 			if (column === pkInfo.primaryKey) {
 				continue
@@ -334,12 +415,13 @@ function generateInsertStatementsWithCycles(
 }
 
 /**
- * Generates UPDATE statements to fix foreign keys set to NULL during INSERT.
- * @param resolvedMappings Resolved mappings from Step 2.
- * @param primaryKeyStatus Primary key status from Step 3.
- * @param tables Output tables from the Mapping.
- * @param updatesNeeded Columns needing updates from Step 7.
- * @returns Array of MySQL UPDATE statements.
+ * Generates UPDATE statements to set FKs (previously NULL) to their correct placeholder values after all inserts.
+ * Uses the primary key placeholder to identify rows accurately.
+ * @param resolvedMappings Mappings with placeholders for PKs and FKs.
+ * @param primaryKeyStatus Primary key status for each table.
+ * @param tables The output tables from the Mapping object.
+ * @param updatesNeeded Record of tables and their FK columns needing updates.
+ * @returns An array of MySQL UPDATE statements.
  */
 function generateUpdateStatements(
 	resolvedMappings: ResolvedMappings,
@@ -364,10 +446,6 @@ function generateUpdateStatements(
 		}
 
 		const pkInfo = primaryKeyStatus[tableKey]
-		if (!pkInfo.isMapped) {
-			throw new Error(`Cannot update ${tableKey}: primary key not mapped`)
-		}
-
 		const pkColumn = pkInfo.primaryKey
 		const pkMapping = resolvedMappings[tableKey][pkColumn]
 		if (!pkMapping) {
@@ -389,30 +467,31 @@ function generateUpdateStatements(
 	return updates
 }
 
-// Step 8: Combine Everything into the Final SQL
-/**
- * Combines all generated SQL statements into the final MySQL script.
- * - No cycles: Lists INSERT statements in topological order.
- * - With cycles: Wraps INSERTs and UPDATEs in a transaction with foreign key checks disabled.
- * @param mapping The Mapping object.
- * @returns The final SQL script as a single string.
- */
+// Step 8: Tie It All Together in generateFinalSql
 async function generateFinalSql(mapping: Mapping): Promise<string> {
+	// Step 2: Group mappings, excluding PKs and FKs
 	const grouped = groupMappingsByDestination(mapping)
 
-	const resolvedResult = await Errors.try(resolveMappings(grouped))
+	// Steps 3 & 4: Resolve mappings with PKs and FKs using placeholders
+	const resolvedResult = await Errors.try(resolveMappings(grouped, mapping))
 	if (resolvedResult.error) {
 		throw Errors.wrap(resolvedResult.error, "Failed to resolve mappings")
 	}
 	const resolvedMappings = resolvedResult.data
 
+	// Step 5: Get primary key status for all tables
 	const primaryKeyStatus = getPrimaryKeyMappingStatus(mapping, grouped)
+
+	// Step 6: Build dependency graph based on FK relationships
 	const graph = buildDependencyGraph(mapping)
+
+	// Step 7: Determine insertion order and detect cycles
 	const { order: topologicalOrder, hasCycles } = topologicalSort(graph)
 
 	let sqlStatements: string[] = []
 
 	if (hasCycles) {
+		// Handle cycles (Step 7 continuation)
 		const cycleResult = Errors.trySync(() =>
 			generateInsertStatementsWithCycles(
 				resolvedMappings,
@@ -422,10 +501,7 @@ async function generateFinalSql(mapping: Mapping): Promise<string> {
 			)
 		)
 		if (cycleResult.error) {
-			throw Errors.wrap(
-				cycleResult.error,
-				"Failed to generate SQL statements for cyclic dependencies"
-			)
+			throw Errors.wrap(cycleResult.error, "Failed to handle cycles")
 		}
 		const { inserts, updatesNeeded } = cycleResult.data
 
@@ -438,12 +514,10 @@ async function generateFinalSql(mapping: Mapping): Promise<string> {
 			)
 		)
 		if (updatesResult.error) {
-			throw Errors.wrap(
-				updatesResult.error,
-				"Failed to generate update statements"
-			)
+			throw Errors.wrap(updatesResult.error, "Failed to generate updates")
 		}
 
+		// Wrap in transaction and disable FK checks for cycles
 		sqlStatements = [
 			"SET FOREIGN_KEY_CHECKS = 0;",
 			"START TRANSACTION;",
@@ -453,6 +527,7 @@ async function generateFinalSql(mapping: Mapping): Promise<string> {
 			"SET FOREIGN_KEY_CHECKS = 1;"
 		]
 	} else {
+		// No cycles, generate inserts in topological order
 		const insertsResult = Errors.trySync(() =>
 			generateInsertStatements(
 				resolvedMappings,
@@ -461,18 +536,16 @@ async function generateFinalSql(mapping: Mapping): Promise<string> {
 			)
 		)
 		if (insertsResult.error) {
-			throw Errors.wrap(
-				insertsResult.error,
-				"Failed to generate insert statements"
-			)
+			throw Errors.wrap(insertsResult.error, "Failed to generate inserts")
 		}
 		sqlStatements = insertsResult.data
 	}
 
+	// Return final SQL script as a single string
 	return sqlStatements.join("\n")
 }
 
-// Function to load mapping from a JSON file
+// Load mapping from a JSON file
 async function loadMapping(filePath: string): Promise<Mapping> {
 	const fileResult = await Errors.try(fs.readFile(filePath, "utf-8"))
 	if (fileResult.error) {
@@ -536,7 +609,6 @@ async function main() {
 	console.log("SQL script file written successfully")
 }
 
-// Run main if this is the entry point
 if (require.main === module) {
 	main().catch(console.error)
 }
