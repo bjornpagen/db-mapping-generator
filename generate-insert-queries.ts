@@ -1,32 +1,18 @@
 import fs from "node:fs/promises"
-import path from "node:path"
-import type { Mapping, ColumnMapping } from "./mapping"
-import type {
-	Database,
-	Table,
-	ForeignKeyConstraint,
-	PrimaryKeyConstraint,
-	Constraint
-} from "./relational"
-import { Errors } from "./errors"
 import OpenAI from "openai"
 import { z } from "zod"
+import type { ColumnMapping, Mapping } from "./mapping"
+import type {
+	ForeignKeyConstraint,
+	PrimaryKeyConstraint,
+	Table
+} from "./relational"
+import { Errors } from "./errors"
 import { zodResponseFormat } from "openai/helpers/zod"
 import { retryWithExponentialBackoff } from "./rate-limiter"
 
-if (!process.env.OPENAI_API_KEY) {
-	console.error("Error: OPENAI_API_KEY environment variable is not set")
-	process.exit(1)
-}
-
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-// Helper function to quote MySQL identifiers
-function quoteIdentifier(name: string): string {
-	return `\`${name.replace(/`/g, "``")}\``
-}
-
-// Schema for SQL expression generation
 const SQLExpressionSchema = z.object({
 	expression: z
 		.string()
@@ -34,6 +20,129 @@ const SQLExpressionSchema = z.object({
 			"The SQL expression that combines all the source columns into a single value"
 		)
 })
+
+// Type definitions from previous steps
+type GroupedMappings = Record<string, Record<string, ColumnMapping[]>>
+type ResolvedMappings = Record<string, Record<string, string>>
+
+// Step 1: Identify All Primary and Foreign Keys
+function identifyKeyColumns(mapping: Mapping): {
+	primaryKeys: Record<string, string>
+	foreignKeys: Record<string, string[]>
+} {
+	const primaryKeys: Record<string, string> = {}
+	const foreignKeys: Record<string, string[]> = {}
+
+	for (const table of mapping.out.tables) {
+		const tableKey = `${table.schema}.${table.name}`
+
+		const pkConstraint = table.constraints.find(
+			(c): c is PrimaryKeyConstraint => c.constraintType === "primaryKey"
+		)
+		if (pkConstraint && pkConstraint.columns.length === 1) {
+			primaryKeys[tableKey] = pkConstraint.columns[0]
+		} else {
+			throw new Error(`Table ${tableKey} must have a single-column primary key`)
+		}
+
+		foreignKeys[tableKey] = []
+		for (const constraint of table.constraints) {
+			if (constraint.constraintType === "foreignKey") {
+				const fkConstraint = constraint as ForeignKeyConstraint
+				foreignKeys[tableKey].push(fkConstraint.sourceColumn)
+			}
+		}
+	}
+
+	return { primaryKeys, foreignKeys }
+}
+
+// Step 2: Group mappings by destination table and column, excluding PK and FK mappings
+export function groupMappingsByDestination(mapping: Mapping): GroupedMappings {
+	const { primaryKeys, foreignKeys } = identifyKeyColumns(mapping)
+	const grouped: GroupedMappings = {}
+
+	for (const colMapping of mapping.columnMappings) {
+		const tableKey = `${colMapping.destinationSchema}.${colMapping.destinationTable}`
+		const columnName = colMapping.destinationColumn
+
+		const isPrimaryKey = primaryKeys[tableKey] === columnName
+		const isForeignKey = (foreignKeys[tableKey] || []).includes(columnName)
+		if (isPrimaryKey || isForeignKey) {
+			continue
+		}
+
+		if (!grouped[tableKey]) {
+			grouped[tableKey] = {}
+		}
+		if (!grouped[tableKey][columnName]) {
+			grouped[tableKey][columnName] = []
+		}
+		grouped[tableKey][columnName].push(colMapping)
+	}
+
+	return grouped
+}
+
+// Step 3 & 4: Resolve mappings into single SQL expressions, including PK and FK mapping with placeholders
+async function resolveMappings(
+	grouped: GroupedMappings,
+	mapping: Mapping
+): Promise<ResolvedMappings> {
+	const resolved: ResolvedMappings = {}
+	const { primaryKeys } = identifyKeyColumns(mapping)
+	const pkPlaceholders = new Map<string, string>()
+	let placeholderCounter = 0
+
+	for (const tableKey in grouped) {
+		resolved[tableKey] = {}
+		for (const column in grouped[tableKey]) {
+			const mappings = grouped[tableKey][column]
+			if (mappings.length === 1) {
+				const cm = mappings[0]
+				resolved[tableKey][column] =
+					`:${cm.sourceSchema}.${cm.sourceTable}.${cm.sourceColumn}`
+			} else {
+				const result = await Errors.try(resolveDuplicateMapping(mappings))
+				if (result.error) {
+					throw result.error
+				}
+				resolved[tableKey][column] = result.data
+			}
+		}
+	}
+
+	for (const tableKey in primaryKeys) {
+		if (!resolved[tableKey]) {
+			resolved[tableKey] = {}
+		}
+		const pkColumn = primaryKeys[tableKey]
+		const placeholder = `:pk_placeholder_${placeholderCounter++}`
+		pkPlaceholders.set(tableKey, placeholder)
+		resolved[tableKey][pkColumn] = placeholder
+	}
+
+	for (const table of mapping.out.tables) {
+		const tableKey = `${table.schema}.${table.name}`
+		for (const constraint of table.constraints) {
+			if (constraint.constraintType === "foreignKey") {
+				const fkConstraint = constraint as ForeignKeyConstraint
+				const fkColumn = fkConstraint.sourceColumn
+				const refTableKey = `${fkConstraint.referencedSchema}.${fkConstraint.referencedTable}`
+				const refPlaceholder = pkPlaceholders.get(refTableKey)
+				if (!refPlaceholder) {
+					throw new Error(`No placeholder for referenced table ${refTableKey}`)
+				}
+				if (!resolved[tableKey]) {
+					resolved[tableKey] = {}
+				}
+				resolved[tableKey][fkColumn] = refPlaceholder
+			}
+		}
+	}
+
+	return resolved
+}
 
 // Helper function to resolve duplicate mappings for non-key columns
 async function resolveDuplicateMapping(
@@ -75,734 +184,431 @@ async function resolveDuplicateMapping(
 	return result
 }
 
-// Loads the Mapping object from a JSON file
-async function loadMapping(filePath: string): Promise<Mapping> {
-	console.log(`Loading mapping file from: ${filePath}`)
+// Step 5: Identify each table's primary key and check if it's mapped
+export function getPrimaryKeyMappingStatus(
+	mapping: Mapping,
+	grouped: GroupedMappings
+): Record<string, { primaryKey: string; isMapped: boolean }> {
+	const status: Record<string, { primaryKey: string; isMapped: boolean }> = {}
 
-	const readResult = await Errors.try(
-		fs.readFile(path.resolve(filePath), "utf-8")
-	)
-	if (readResult.error) {
-		if (
-			readResult.error instanceof Error &&
-			"code" in readResult.error &&
-			readResult.error.code === "ENOENT"
-		) {
-			throw new Error(`File not found: ${filePath}`)
-		}
-		throw Errors.wrap(readResult.error, "Failed to read mapping file")
-	}
-
-	console.log("Successfully read mapping file, parsing JSON...")
-
-	const parseResult = Errors.trySync(() => JSON.parse(readResult.data))
-	if (parseResult.error) {
-		throw Errors.wrap(parseResult.error, "Failed to parse mapping file")
-	}
-
-	const json = parseResult.data
-	const missingFields = []
-	if (!json.type) {
-		missingFields.push("type")
-	}
-	if (json.type !== "mapping") {
-		missingFields.push("type (expected 'mapping')")
-	}
-	if (!json.in) {
-		missingFields.push("in")
-	}
-	if (!json.out) {
-		missingFields.push("out")
-	}
-	if (!json.columnMappings) {
-		missingFields.push("columnMappings")
-	}
-	if (missingFields.length > 0) {
-		throw new Error(
-			`Invalid mapping structure: missing or invalid fields: ${missingFields.join(", ")}`
+	for (const table of mapping.out.tables) {
+		const tableKey = `${table.schema}.${table.name}`
+		const pkConstraint = table.constraints.find(
+			(c): c is PrimaryKeyConstraint => c.constraintType === "primaryKey"
 		)
+		if (!pkConstraint || pkConstraint.columns.length !== 1) {
+			throw new Error(
+				`Table ${tableKey} must have a single primary key constraint.`
+			)
+		}
+
+		const primaryKey = pkConstraint.columns[0]
+		const isMapped = !!grouped[tableKey]?.[primaryKey]?.length
+
+		status[tableKey] = { primaryKey, isMapped }
 	}
 
-	console.log(
-		`Mapping loaded successfully with ${json.columnMappings.length} column mappings`
-	)
-	console.log(`Source DB: ${json.in.dialect}, Target DB: ${json.out.dialect}`)
-
-	return json as Mapping
+	return status
 }
 
-// Type for mapping groups
-type MappingGroup = {
-	sourceSchema: string
-	sourceTable: string
-	mappings: ColumnMapping[]
-}
-
-// Groups mappings by target table and source table
-function groupMappingsByTargetTable(
+// Step 6: Build a dependency graph based on foreign keys
+export function buildDependencyGraph(
 	mapping: Mapping
-): Map<string, MappingGroup[]> {
-	console.log(
-		`Grouping ${mapping.columnMappings.length} mappings by target table...`
-	)
+): Record<string, string[]> {
+	const graph: Record<string, string[]> = {}
 
-	const map = new Map<string, MappingGroup[]>()
-	for (const cm of mapping.columnMappings) {
-		if (cm.destinationSchema && cm.destinationTable) {
-			const tableKey = `${cm.destinationSchema}.${cm.destinationTable}`
-			if (!map.has(tableKey)) {
-				map.set(tableKey, [])
+	for (const table of mapping.out.tables) {
+		const tableKey = `${table.schema}.${table.name}`
+		graph[tableKey] = []
+
+		for (const constraint of table.constraints) {
+			if (constraint.constraintType === "foreignKey") {
+				const fkConstraint = constraint as ForeignKeyConstraint
+				const referencedKey = `${fkConstraint.referencedSchema}.${fkConstraint.referencedTable}`
+				graph[tableKey].push(referencedKey)
 			}
-			const groups = map.get(tableKey) ?? []
-			let group = groups.find(
-				(g) =>
-					g.sourceSchema === cm.sourceSchema && g.sourceTable === cm.sourceTable
-			)
-			if (!group) {
-				group = {
-					sourceSchema: cm.sourceSchema,
-					sourceTable: cm.sourceTable,
-					mappings: []
-				}
-				groups.push(group)
-			}
-			group.mappings.push(cm)
 		}
 	}
 
-	console.log(`Grouped mappings into ${map.size} target tables`)
-	for (const [tableKey, groups] of map.entries()) {
-		console.log(
-			`  - ${tableKey}: ${groups.length} source tables, ${groups.reduce((acc, g) => acc + g.mappings.length, 0)} mappings`
-		)
-	}
-
-	return map
+	return graph
 }
 
-// Helper function to get the single primary key column for a table
-function getPrimaryKeyColumn(table: Table): string | undefined {
-	const pkConstraint = table.constraints.find(
-		(c: Constraint) => c.constraintType === "primaryKey"
-	) as PrimaryKeyConstraint | undefined
-	return pkConstraint?.columns.length === 1
-		? pkConstraint.columns[0]
-		: undefined
-}
-
-// Helper function to get foreign key columns for a table
-function getForeignKeyColumns(table: Table): string[] {
-	return table.constraints
-		.filter((c): c is ForeignKeyConstraint => c.constraintType === "foreignKey")
-		.map((fk) => fk.sourceColumn)
-}
-
-// Builds a dependency graph and computes insertion order, handling cycles
-function getInsertionOrder(database: Database): {
-	nonCycleTables: string[]
-	cycleTables: string[]
+// Step 7: Sort the tables by dependencies and spot cycles
+export function topologicalSort(graph: Record<string, string[]>): {
+	order: string[]
+	hasCycles: boolean
 } {
-	console.log(
-		`Computing insertion order for ${database.tables.length} tables...`
-	)
-
-	if (database.dialect !== "mysql") {
-		throw new Error(
-			"Target database dialect must be 'mysql' for this implementation"
-		)
-	}
-
-	const tableMap: Record<string, Table> = {}
-	for (const table of database.tables) {
-		tableMap[`${table.schema}.${table.name}`] = table
-	}
-
-	const dependencies: Record<string, Set<string>> = {}
-	const allTables = new Set<string>()
-	for (const table of database.tables) {
-		const tableKey = `${table.schema}.${table.name}`
-		allTables.add(tableKey)
-		dependencies[tableKey] = new Set()
-	}
-
-	console.log("Building dependency graph...")
-	for (const table of database.tables) {
-		const tableKey = `${table.schema}.${table.name}`
-		const fkConstraints = table.constraints.filter(
-			(c): c is ForeignKeyConstraint => c.constraintType === "foreignKey"
-		)
-		if (fkConstraints.length > 0) {
-			console.log(
-				`  - ${tableKey} has ${fkConstraints.length} foreign key constraints`
-			)
-		}
-		for (const fk of fkConstraints) {
-			const referencedTableKey = `${fk.referencedSchema}.${fk.referencedTable}`
-			if (tableMap[referencedTableKey] && referencedTableKey !== tableKey) {
-				dependencies[tableKey].add(referencedTableKey)
-			}
-		}
-	}
-
+	const visiting = new Set<string>()
 	const visited = new Set<string>()
-	const tempMark = new Set<string>()
-	const stack: string[] = []
-	const cycleTables = new Set<string>()
+	const order: string[] = []
+	let hasCycles = false
 
-	function visit(node: string, path: string[] = []) {
-		if (tempMark.has(node)) {
-			const cycleStartIndex = path.indexOf(node)
-			for (let i = cycleStartIndex; i < path.length; i++) {
-				cycleTables.add(path[i])
-			}
-			cycleTables.add(node)
-			console.log(`Detected cycle involving: ${node}`)
+	function dfs(node: string) {
+		if (visited.has(node)) {
 			return
 		}
+		if (visiting.has(node)) {
+			hasCycles = true
+			return
+		}
+		visiting.add(node)
+		for (const dependency of graph[node] || []) {
+			dfs(dependency)
+		}
+		visiting.delete(node)
+		visited.add(node)
+		order.push(node)
+	}
+
+	for (const node of Object.keys(graph)) {
 		if (!visited.has(node)) {
-			tempMark.add(node)
-			path.push(node)
-			for (const dep of dependencies[node]) {
-				visit(dep, [...path])
-			}
-			tempMark.delete(node)
-			visited.add(node)
-			stack.push(node)
+			dfs(node)
 		}
 	}
 
-	for (const table of allTables) {
-		if (!visited.has(table)) {
-			visit(table)
-		}
-	}
-
-	const nonCycleTables = stack.filter((t) => !cycleTables.has(t))
-	console.log(
-		`Identified ${nonCycleTables.length} tables without cycles and ${cycleTables.size} tables in cycles`
-	)
-
-	return { nonCycleTables, cycleTables: Array.from(cycleTables) }
+	return { order: order.reverse(), hasCycles }
 }
 
-// Union-Find structure for canonicalizing IDs
-class UnionFind {
-	parent: Record<string, string>
-	rank: Record<string, number>
+// Step 8: Generate Insert Statements for Non-Cyclic Tables
+function generateInsertStatements(
+	resolvedMappings: ResolvedMappings,
+	primaryKeyStatus: Record<string, { primaryKey: string; isMapped: boolean }>,
+	topologicalOrder: string[]
+): string[] {
+	const inserts: string[] = []
 
-	constructor() {
-		this.parent = {}
-		this.rank = {}
+	for (const tableKey of topologicalOrder) {
+		const [schema, table] = tableKey.split(".")
+		const tableMappings = resolvedMappings[tableKey] || {}
+		const pkInfo = primaryKeyStatus[tableKey]
+		if (!pkInfo) {
+			throw new Error(`No primary key info for table ${tableKey}`)
+		}
+
+		const columnsToInsert: string[] = []
+		const values: string[] = []
+
+		const pkColumn = pkInfo.primaryKey
+		if (tableMappings[pkColumn]) {
+			columnsToInsert.push(pkColumn)
+			values.push(tableMappings[pkColumn])
+		} else {
+			throw new Error(
+				`No mapping for primary key ${pkColumn} in table ${tableKey}`
+			)
+		}
+
+		for (const column in tableMappings) {
+			if (column !== pkColumn) {
+				columnsToInsert.push(column)
+				values.push(tableMappings[column])
+			}
+		}
+
+		if (columnsToInsert.length > 0) {
+			const insertSql = `INSERT INTO ${schema}.${table} (${columnsToInsert.join(", ")}) VALUES (${values.join(", ")});`
+			inserts.push(insertSql)
+		}
 	}
 
-	find(x: string): string {
-		if (this.parent[x] === undefined) {
-			this.parent[x] = x
-			this.rank[x] = 0
+	return inserts
+}
+
+// Step 7: Handle Cycles in Dependencies
+
+/**
+ * Identifies foreign keys to set to NULL during INSERT to break cycles, based on topological order.
+ * If a referenced table appears after the current table in the order, its FK is set to NULL.
+ * @param table The table to analyze for foreign key constraints.
+ * @param topologicalOrder The order of tables from topological sort.
+ * @returns Array of foreign key column names to set to NULL during insertion.
+ */
+function getForeignKeysToSetNull(
+	table: Table,
+	topologicalOrder: string[]
+): string[] {
+	const tableKey = `${table.schema}.${table.name}`
+	const tableIndex = topologicalOrder.indexOf(tableKey)
+	const fkToSetNull: string[] = []
+
+	for (const constraint of table.constraints) {
+		if (constraint.constraintType === "foreignKey") {
+			const fkConstraint = constraint as ForeignKeyConstraint
+			const referencedKey = `${fkConstraint.referencedSchema}.${fkConstraint.referencedTable}`
+			const referencedIndex = topologicalOrder.indexOf(referencedKey)
+			if (referencedIndex > tableIndex) {
+				fkToSetNull.push(fkConstraint.sourceColumn)
+			}
 		}
-		if (this.parent[x] !== x) {
-			this.parent[x] = this.find(this.parent[x])
-		}
-		return this.parent[x]
 	}
 
-	union(x: string, y: string) {
-		const rootX = this.find(x)
-		const rootY = this.find(y)
-		if (rootX !== rootY) {
-			if (this.rank[rootX] > this.rank[rootY]) {
-				this.parent[rootY] = rootX
-			} else if (this.rank[rootX] < this.rank[rootY]) {
-				this.parent[rootX] = rootY
+	return fkToSetNull
+}
+
+/**
+ * Generates INSERT statements for tables, handling cycles by setting conflicting FKs to NULL.
+ * Tracks which FKs need subsequent updates to their correct placeholder values.
+ * @param resolvedMappings Mappings with placeholders for PKs and FKs from prior steps.
+ * @param primaryKeyStatus Primary key status for each table.
+ * @param tables The output tables from the Mapping object.
+ * @param topologicalOrder The order of tables, possibly imperfect due to cycles.
+ * @returns An object with INSERT statements and a record of columns needing updates.
+ */
+function generateInsertStatementsWithCycles(
+	resolvedMappings: ResolvedMappings,
+	primaryKeyStatus: Record<string, { primaryKey: string; isMapped: boolean }>,
+	tables: Table[],
+	topologicalOrder: string[]
+): { inserts: string[]; updatesNeeded: Record<string, string[]> } {
+	const inserts: string[] = []
+	const updatesNeeded: Record<string, string[]> = {}
+
+	for (const tableKey of topologicalOrder) {
+		const [schema, tableName] = tableKey.split(".")
+		const table = tables.find(
+			(t) => t.schema === schema && t.name === tableName
+		)
+		if (!table) {
+			throw new Error(`Table ${tableKey} not found`)
+		}
+
+		const tableMappings = resolvedMappings[tableKey] || {}
+		const pkInfo = primaryKeyStatus[tableKey]
+		if (!pkInfo) {
+			throw new Error(`No primary key info for ${tableKey}`)
+		}
+
+		const columnsToInsert: string[] = []
+		const values: string[] = []
+
+		// Include primary key with its placeholder
+		if (tableMappings[pkInfo.primaryKey]) {
+			columnsToInsert.push(pkInfo.primaryKey)
+			values.push(tableMappings[pkInfo.primaryKey])
+		}
+
+		// Identify FKs to set to NULL due to cycles
+		const fkToSetNull = getForeignKeysToSetNull(table, topologicalOrder)
+
+		// Process all mapped columns
+		for (const column in tableMappings) {
+			if (column === pkInfo.primaryKey) {
+				continue
+			}
+			columnsToInsert.push(column)
+			if (fkToSetNull.includes(column)) {
+				values.push("NULL")
+				updatesNeeded[tableKey] = updatesNeeded[tableKey] || []
+				updatesNeeded[tableKey].push(column)
 			} else {
-				this.parent[rootY] = rootX
-				this.rank[rootX]++
+				values.push(tableMappings[column])
 			}
 		}
+
+		if (columnsToInsert.length > 0) {
+			const insertSql = `INSERT INTO ${schema}.${tableName} (${columnsToInsert.join(", ")}) VALUES (${values.join(", ")});`
+			inserts.push(insertSql)
+		}
 	}
+
+	return { inserts, updatesNeeded }
 }
 
-// Generates insert SQL strings with named placeholders, canonicalizing IDs
-export async function generateInsertQueries(mapping: Mapping): Promise<{
-	nonCycleInserts: { tableKey: string; sourceKey: string; sql: string }[]
-	cycleTransaction: {
-		inserts: { tableKey: string; sourceKey: string; sql: string }[]
-	}
-	warnings: string[]
-}> {
-	console.log(
-		`Starting insert query generation for mapping with ${mapping.columnMappings.length} column mappings`
-	)
+/**
+ * Generates UPDATE statements to set FKs (previously NULL) to their correct placeholder values after all inserts.
+ * Uses the primary key placeholder to identify rows accurately.
+ * @param resolvedMappings Mappings with placeholders for PKs and FKs.
+ * @param primaryKeyStatus Primary key status for each table.
+ * @param tables The output tables from the Mapping object.
+ * @param updatesNeeded Record of tables and their FK columns needing updates.
+ * @returns An array of MySQL UPDATE statements.
+ */
+function generateUpdateStatements(
+	resolvedMappings: ResolvedMappings,
+	primaryKeyStatus: Record<string, { primaryKey: string; isMapped: boolean }>,
+	tables: Table[],
+	updatesNeeded: Record<string, string[]>
+): string[] {
+	const updates: string[] = []
 
-	const sourceDb = mapping.in
-	const targetDb = mapping.out
-	if (targetDb.dialect !== "mysql") {
-		throw new Error("Target database must be MySQL.")
-	}
-	const groupedMappings = groupMappingsByTargetTable(mapping)
-	const { nonCycleTables, cycleTables } = getInsertionOrder(targetDb)
-	const warnings: string[] = []
-
-	// Build union-find structure for source columns based on foreign key relationships
-	const uf = new UnionFind()
-	const columnToTable: Record<string, string> = {}
-	for (const table of sourceDb.tables) {
-		const tableKey = `${table.schema}.${table.name}`
-		for (const column of table.columns) {
-			const columnKey = `${table.schema}.${table.name}.${column.name}`
-			uf.find(columnKey) // Initialize node in union-find
-			columnToTable[columnKey] = tableKey
-		}
-		const fkConstraints = table.constraints.filter(
-			(c): c is ForeignKeyConstraint => c.constraintType === "foreignKey"
+	for (const tableKey in updatesNeeded) {
+		const [schema, tableName] = tableKey.split(".")
+		const table = tables.find(
+			(t) => t.schema === schema && t.name === tableName
 		)
-		for (const fk of fkConstraints) {
-			const sourceColumnKey = `${fk.sourceSchema}.${fk.sourceTable}.${fk.sourceColumn}`
-			const referencedColumnKey = `${fk.referencedSchema}.${fk.referencedTable}.${fk.referencedColumn}`
-			uf.union(sourceColumnKey, referencedColumnKey) // Merge FK and PK
+		if (!table) {
+			throw new Error(`Table ${tableKey} not found`)
 		}
+
+		const columnsToUpdate = updatesNeeded[tableKey]
+		if (!columnsToUpdate.length) {
+			continue
+		}
+
+		const pkInfo = primaryKeyStatus[tableKey]
+		const pkColumn = pkInfo.primaryKey
+		const pkMapping = resolvedMappings[tableKey][pkColumn]
+		if (!pkMapping) {
+			throw new Error(`No mapping for primary key ${pkColumn} in ${tableKey}`)
+		}
+
+		const setClauses = columnsToUpdate.map((column) => {
+			const mapping = resolvedMappings[tableKey][column]
+			if (!mapping) {
+				throw new Error(`No mapping for column ${column} in ${tableKey}`)
+			}
+			return `${column} = ${mapping}`
+		})
+
+		const updateSql = `UPDATE ${schema}.${tableName} SET ${setClauses.join(", ")} WHERE ${pkColumn} = ${pkMapping};`
+		updates.push(updateSql)
 	}
 
-	// Determine canonical representatives (prefer primary keys)
-	const canonicalMap: Record<string, string> = {}
-	for (const columnKey of Object.keys(uf.parent)) {
-		const root = uf.find(columnKey)
-		if (canonicalMap[root] === undefined) {
-			const tableKey = columnToTable[columnKey]
-			const table = sourceDb.tables.find(
-				(t) => `${t.schema}.${t.name}` === tableKey
-			)
-			if (table) {
-				const pkColumn = getPrimaryKeyColumn(table)
-				if (pkColumn) {
-					const pkColumnKey = `${table.schema}.${table.name}.${pkColumn}`
-					if (uf.find(pkColumnKey) === root) {
-						canonicalMap[root] = pkColumnKey // Use PK as canonical if in the same set
-					}
-				}
-			}
-			if (canonicalMap[root] === undefined) {
-				canonicalMap[root] = columnKey // Default to first column if no PK
-			}
-		}
-		canonicalMap[columnKey] = canonicalMap[root]
-	}
-
-	// Non-cycle inserts
-	const nonCycleInserts: {
-		tableKey: string
-		sourceKey: string
-		sql: string
-	}[] = []
-	for (const tableKey of nonCycleTables) {
-		console.log(`Processing non-cycle table: ${tableKey}`)
-
-		const mappingGroups = groupedMappings.get(tableKey) || []
-		if (mappingGroups.length === 0) {
-			console.log(`  - No mappings found for ${tableKey}, skipping`)
-			continue
-		}
-
-		const tableDef = targetDb.tables.find(
-			(t) => `${t.schema}.${t.name}` === tableKey
-		)
-		if (!tableDef) {
-			warnings.push(`No table definition found for ${tableKey}`)
-			continue
-		}
-
-		const pkColumn = getPrimaryKeyColumn(tableDef)
-		if (!pkColumn) {
-			warnings.push(`No primary key found for ${tableKey}, skipping`)
-			continue
-		}
-
-		const fkColumns = getForeignKeyColumns(tableDef)
-		const excludeColumns = new Set([pkColumn, ...fkColumns])
-
-		for (const group of mappingGroups) {
-			const sourceKey = `${group.sourceSchema}.${group.sourceTable}`
-			console.log(`  - Processing mappings from ${sourceKey}`)
-
-			const mappings = group.mappings
-			if (mappings.length === 0) {
-				continue
-			}
-
-			// Filter out PK and FK mappings
-			const otherMappings = mappings.filter(
-				(cm) => !excludeColumns.has(cm.destinationColumn)
-			)
-
-			// Handle non-key columns for duplicates
-			const mappingMap = new Map<string, ColumnMapping[]>()
-			for (const cm of otherMappings) {
-				if (!mappingMap.has(cm.destinationColumn)) {
-					mappingMap.set(cm.destinationColumn, [cm])
-				} else {
-					const mappings = mappingMap.get(cm.destinationColumn)
-					if (mappings) {
-						mappings.push(cm)
-					}
-				}
-			}
-
-			const resolvedMappings: { mapping: ColumnMapping; value: string }[] = []
-			for (const [destCol, cms] of mappingMap.entries()) {
-				if (cms.length === 1) {
-					resolvedMappings.push({
-						mapping: cms[0],
-						value: `:${cms[0].sourceSchema}.${cms[0].sourceTable}.${cms[0].sourceColumn}`
-					})
-				} else {
-					const combineResult = await Errors.try(resolveDuplicateMapping(cms))
-					if (combineResult.error || !combineResult.data) {
-						warnings.push(
-							`Failed to combine duplicate mappings for ${tableKey}.${destCol} from ${sourceKey}`
-						)
-						resolvedMappings.push({
-							mapping: cms[0],
-							value: `:${cms[0].sourceSchema}.${cms[0].sourceTable}.${cms[0].sourceColumn}`
-						})
-					} else {
-						resolvedMappings.push({
-							mapping: cms[0],
-							value: combineResult.data
-						})
-					}
-				}
-			}
-
-			// Include new PK
-			resolvedMappings.push({
-				mapping: {
-					sourceSchema: "",
-					sourceTable: "",
-					sourceColumn: "",
-					destinationSchema: tableDef.schema,
-					destinationTable: tableDef.name,
-					destinationColumn: pkColumn,
-					description: "New primary key"
-				},
-				value: ":new_pk"
-			})
-
-			// Include FKs with canonicalized placeholders if there is a mapping
-			for (const fkColumn of fkColumns) {
-				const fkMapping = mappings.find(
-					(cm) => cm.destinationColumn === fkColumn
-				)
-				if (fkMapping) {
-					const sourceColumnKey = `${fkMapping.sourceSchema}.${fkMapping.sourceTable}.${fkMapping.sourceColumn}`
-					const canonicalColumn = canonicalMap[sourceColumnKey]
-					if (canonicalColumn) {
-						resolvedMappings.push({
-							mapping: fkMapping,
-							value: `:mapped_${canonicalColumn}`
-						})
-					} else {
-						warnings.push(
-							`No canonical column found for ${sourceColumnKey}, using original`
-						)
-						resolvedMappings.push({
-							mapping: fkMapping,
-							value: `:mapped_${fkMapping.sourceSchema}.${fkMapping.sourceTable}.${fkMapping.sourceColumn}`
-						})
-					}
-				} else if (
-					!tableDef.columns.find((col) => col.name === fkColumn)?.isNullable
-				) {
-					warnings.push(
-						`No mapping for non-nullable FK ${tableKey}.${fkColumn}, it will be NULL`
-					)
-				}
-			}
-
-			if (resolvedMappings.length === 0) {
-				console.log(`  - No resolved mappings for ${sourceKey}, skipping`)
-				continue
-			}
-
-			const columns = resolvedMappings.map((item) =>
-				quoteIdentifier(item.mapping.destinationColumn)
-			)
-			const values = resolvedMappings.map((item) => item.value)
-			const tableFullName = `${quoteIdentifier(tableDef.schema)}.${quoteIdentifier(tableDef.name)}`
-			const sql = `INSERT INTO ${tableFullName} (${columns.join(", ")}) VALUES (${values.join(", ")})`
-			console.log(`  - Generated SQL for ${tableKey} from ${sourceKey}: ${sql}`)
-			nonCycleInserts.push({ tableKey, sourceKey, sql })
-		}
-	}
-
-	// Cycle inserts (similar logic)
-	const cycleInserts: { tableKey: string; sourceKey: string; sql: string }[] =
-		[]
-	for (const tableKey of cycleTables) {
-		console.log(`Processing cycle table: ${tableKey}`)
-
-		const mappingGroups = groupedMappings.get(tableKey) || []
-		if (mappingGroups.length === 0) {
-			console.log(`  - No mappings found for ${tableKey}, skipping`)
-			continue
-		}
-
-		const tableDef = targetDb.tables.find(
-			(t) => `${t.schema}.${t.name}` === tableKey
-		)
-		if (!tableDef) {
-			warnings.push(`No table definition found for ${tableKey}`)
-			continue
-		}
-
-		const pkColumn = getPrimaryKeyColumn(tableDef)
-		if (!pkColumn) {
-			warnings.push(`No primary key found for ${tableKey}, skipping`)
-			continue
-		}
-
-		const fkColumns = getForeignKeyColumns(tableDef)
-		const excludeColumns = new Set([pkColumn, ...fkColumns])
-
-		for (const group of mappingGroups) {
-			const sourceKey = `${group.sourceSchema}.${group.sourceTable}`
-			console.log(`  - Processing mappings from ${sourceKey}`)
-
-			const mappings = group.mappings
-			if (mappings.length === 0) {
-				continue
-			}
-
-			// Filter out PK and FK mappings
-			const otherMappings = mappings.filter(
-				(cm) => !excludeColumns.has(cm.destinationColumn)
-			)
-
-			// Handle non-key columns for duplicates
-			const mappingMap = new Map<string, ColumnMapping[]>()
-			for (const cm of otherMappings) {
-				if (!mappingMap.has(cm.destinationColumn)) {
-					mappingMap.set(cm.destinationColumn, [cm])
-				} else {
-					const mappings = mappingMap.get(cm.destinationColumn)
-					if (mappings) {
-						mappings.push(cm)
-					}
-				}
-			}
-
-			const resolvedMappings: { mapping: ColumnMapping; value: string }[] = []
-			for (const [destCol, cms] of mappingMap.entries()) {
-				if (cms.length === 1) {
-					resolvedMappings.push({
-						mapping: cms[0],
-						value: `:${cms[0].sourceSchema}.${cms[0].sourceTable}.${cms[0].sourceColumn}`
-					})
-				} else {
-					const combineResult = await Errors.try(resolveDuplicateMapping(cms))
-					if (combineResult.error || !combineResult.data) {
-						warnings.push(
-							`Failed to combine duplicate mappings for ${tableKey}.${destCol} from ${sourceKey}`
-						)
-						resolvedMappings.push({
-							mapping: cms[0],
-							value: `:${cms[0].sourceSchema}.${cms[0].sourceTable}.${cms[0].sourceColumn}`
-						})
-					} else {
-						resolvedMappings.push({
-							mapping: cms[0],
-							value: combineResult.data
-						})
-					}
-				}
-			}
-
-			// Include new PK
-			resolvedMappings.push({
-				mapping: {
-					sourceSchema: "",
-					sourceTable: "",
-					sourceColumn: "",
-					destinationSchema: tableDef.schema,
-					destinationTable: tableDef.name,
-					destinationColumn: pkColumn,
-					description: "New primary key"
-				},
-				value: ":new_pk"
-			})
-
-			// Include FKs with canonicalized placeholders if there is a mapping
-			for (const fkColumn of fkColumns) {
-				const fkMapping = mappings.find(
-					(cm) => cm.destinationColumn === fkColumn
-				)
-				if (fkMapping) {
-					const sourceColumnKey = `${fkMapping.sourceSchema}.${fkMapping.sourceTable}.${fkMapping.sourceColumn}`
-					const canonicalColumn = canonicalMap[sourceColumnKey]
-					if (canonicalColumn) {
-						resolvedMappings.push({
-							mapping: fkMapping,
-							value: `:mapped_${canonicalColumn}`
-						})
-					} else {
-						warnings.push(
-							`No canonical column found for ${sourceColumnKey}, using original`
-						)
-						resolvedMappings.push({
-							mapping: fkMapping,
-							value: `:mapped_${fkMapping.sourceSchema}.${fkMapping.sourceTable}.${fkMapping.sourceColumn}`
-						})
-					}
-				} else if (
-					!tableDef.columns.find((col) => col.name === fkColumn)?.isNullable
-				) {
-					warnings.push(
-						`No mapping for non-nullable FK ${tableKey}.${fkColumn}, it will be NULL`
-					)
-				}
-			}
-
-			if (resolvedMappings.length === 0) {
-				console.log(`  - No resolved mappings for ${sourceKey}, skipping`)
-				continue
-			}
-
-			const columns = resolvedMappings.map((item) =>
-				quoteIdentifier(item.mapping.destinationColumn)
-			)
-			const values = resolvedMappings.map((item) => item.value)
-			const tableFullName = `${quoteIdentifier(tableDef.schema)}.${quoteIdentifier(tableDef.name)}`
-			const sql = `INSERT INTO ${tableFullName} (${columns.join(", ")}) VALUES (${values.join(", ")})`
-			console.log(`  - Generated SQL for ${tableKey} from ${sourceKey}: ${sql}`)
-			cycleInserts.push({ tableKey, sourceKey, sql })
-		}
-	}
-
-	console.log(
-		`Query generation complete: ${nonCycleInserts.length} non-cycle inserts, ${cycleInserts.length} cycle inserts, ${warnings.length} warnings`
-	)
-
-	return {
-		nonCycleInserts,
-		cycleTransaction: { inserts: cycleInserts },
-		warnings
-	}
+	return updates
 }
 
-// Builds a report string from the SQL strings
-function buildReport(
-	result: Awaited<ReturnType<typeof generateInsertQueries>>
-): string {
-	console.log(
-		`Building report with ${result.nonCycleInserts.length} non-cycle inserts, ${result.cycleTransaction.inserts.length} cycle inserts`
-	)
+// Step 8: Tie It All Together in generateFinalSql
+async function generateFinalSql(mapping: Mapping): Promise<string> {
+	// Step 2: Group mappings, excluding PKs and FKs
+	const grouped = groupMappingsByDestination(mapping)
 
-	let report = "Insert Queries Report\n\n"
+	// Steps 3 & 4: Resolve mappings with PKs and FKs using placeholders
+	const resolvedResult = await Errors.try(resolveMappings(grouped, mapping))
+	if (resolvedResult.error) {
+		throw Errors.wrap(resolvedResult.error, "Failed to resolve mappings")
+	}
+	const resolvedMappings = resolvedResult.data
 
-	if (result.warnings.length > 0) {
-		report += "Warnings:\n"
-		for (const warning of result.warnings) {
-			report += `  - ${warning}\n`
+	// Step 5: Get primary key status for all tables
+	const primaryKeyStatus = getPrimaryKeyMappingStatus(mapping, grouped)
+
+	// Step 6: Build dependency graph based on FK relationships
+	const graph = buildDependencyGraph(mapping)
+
+	// Step 7: Determine insertion order and detect cycles
+	const { order: topologicalOrder, hasCycles } = topologicalSort(graph)
+
+	let sqlStatements: string[] = []
+
+	if (hasCycles) {
+		// Handle cycles (Step 7 continuation)
+		const cycleResult = Errors.trySync(() =>
+			generateInsertStatementsWithCycles(
+				resolvedMappings,
+				primaryKeyStatus,
+				mapping.out.tables,
+				topologicalOrder
+			)
+		)
+		if (cycleResult.error) {
+			throw Errors.wrap(cycleResult.error, "Failed to handle cycles")
 		}
-		report += "\n"
-	}
+		const { inserts, updatesNeeded } = cycleResult.data
 
-	report += "Non-cycle tables in insertion order:\n\n"
-	for (const [
-		index,
-		{ tableKey, sourceKey, sql }
-	] of result.nonCycleInserts.entries()) {
-		report += `${index + 1}. ${tableKey} from ${sourceKey}\n`
-		report += "   Insert Query:\n"
-		report += `   - ${sql}\n\n`
-	}
-
-	if (result.cycleTransaction.inserts.length > 0) {
-		report += "Cycle tables:\n\n"
-		report += "SET FOREIGN_KEY_CHECKS = 0;\n"
-		report += "START TRANSACTION;\n\n"
-		for (const { tableKey, sourceKey, sql } of result.cycleTransaction
-			.inserts) {
-			report += `   - ${sql}  -- ${tableKey} from ${sourceKey}\n`
+		const updatesResult = Errors.trySync(() =>
+			generateUpdateStatements(
+				resolvedMappings,
+				primaryKeyStatus,
+				mapping.out.tables,
+				updatesNeeded
+			)
+		)
+		if (updatesResult.error) {
+			throw Errors.wrap(updatesResult.error, "Failed to generate updates")
 		}
-		report += "COMMIT;\n"
-		report += "SET FOREIGN_KEY_CHECKS = 1;\n\n"
+
+		// Wrap in transaction and disable FK checks for cycles
+		sqlStatements = [
+			"SET FOREIGN_KEY_CHECKS = 0;",
+			"START TRANSACTION;",
+			...inserts,
+			...updatesResult.data,
+			"COMMIT;",
+			"SET FOREIGN_KEY_CHECKS = 1;"
+		]
+	} else {
+		// No cycles, generate inserts in topological order
+		const insertsResult = Errors.trySync(() =>
+			generateInsertStatements(
+				resolvedMappings,
+				primaryKeyStatus,
+				topologicalOrder
+			)
+		)
+		if (insertsResult.error) {
+			throw Errors.wrap(insertsResult.error, "Failed to generate inserts")
+		}
+		sqlStatements = insertsResult.data
 	}
 
-	report += "Notes:\n"
-	report +=
-		"- Placeholders like `:source_schema.source_table.source_column` should be replaced with actual values from the source database.\n"
-	report +=
-		"- Placeholders like `:new_pk` should be replaced with new UUIDs generated for primary keys.\n"
-	report +=
-		"- Placeholders like `:mapped_source_schema.source_table.source_column` (where the column is the canonical representative) should be replaced with the new PKs corresponding to the source values, ensuring all IDs in the same equivalence class (connected via foreign keys) use the same ID.\n"
-
-	console.log(`Report generated with ${report.length} characters`)
-	return report
+	// Return final SQL script as a single string
+	return sqlStatements.join("\n")
 }
 
-// Main function to execute the process and log the report
+// Load mapping from a JSON file
+async function loadMapping(filePath: string): Promise<Mapping> {
+	const fileResult = await Errors.try(fs.readFile(filePath, "utf-8"))
+	if (fileResult.error) {
+		throw Errors.wrap(
+			fileResult.error,
+			`Failed to load mapping from ${filePath}`
+		)
+	}
+
+	const result = Errors.trySync(() => JSON.parse(fileResult.data) as Mapping)
+	if (result.error) {
+		throw Errors.wrap(
+			result.error,
+			`Failed to parse mapping JSON from ${filePath}`
+		)
+	}
+	return result.data
+}
+
+// Main function to execute the process
 async function main() {
 	console.log("Starting insert query generation process")
 
 	const mappingFilePath = process.argv[2]
 	if (!mappingFilePath) {
-		console.error(
-			"Usage: bun run generate-insert-queries.ts <mapping-file-path>"
-		)
+		console.error("Usage: bun run query-generator.ts <mapping-file-path>")
 		process.exit(1)
 	}
 
 	console.log(`Loading mapping from file: ${mappingFilePath}`)
+
 	const mappingResult = await Errors.try(loadMapping(mappingFilePath))
 	if (mappingResult.error) {
-		console.error(
-			"Error:",
-			mappingResult.error instanceof Error
-				? mappingResult.error.message
-				: String(mappingResult.error)
-		)
+		console.error("Error:", mappingResult.error.toString())
 		process.exit(1)
 	}
+	const mapping = mappingResult.data
 	console.log(
-		`Successfully loaded mapping with ${mappingResult.data.columnMappings.length} column mappings`
+		`Successfully loaded mapping with ${mapping.columnMappings.length} column mappings`
 	)
 
 	console.log("Generating insert queries...")
-	const queriesResult = await Errors.try(
-		generateInsertQueries(mappingResult.data)
-	)
-	if (queriesResult.error) {
-		console.error(
-			"Error:",
-			queriesResult.error instanceof Error
-				? queriesResult.error.message
-				: String(queriesResult.error)
-		)
+
+	const sqlResult = await Errors.try(generateFinalSql(mapping))
+	if (sqlResult.error) {
+		console.error("Error:", sqlResult.error.toString())
 		process.exit(1)
 	}
+	const sqlScript = sqlResult.data
 	console.log("Insert queries generated successfully")
 
-	console.log("Building report...")
-	const report = buildReport(queriesResult.data)
-	console.log("Report built successfully")
-	console.log(report)
+	const outputFile = "insert_queries.sql"
+	console.log(`Writing SQL script to file: ${outputFile}`)
 
-	console.log("Writing report to file: insert_queries_report.txt")
-	const writeResult = await Errors.try(
-		fs.writeFile("insert_queries_report.txt", report)
-	)
+	const writeResult = await Errors.try(fs.writeFile(outputFile, sqlScript))
 	if (writeResult.error) {
-		console.error(
-			"Error writing report file:",
-			writeResult.error instanceof Error
-				? writeResult.error.message
-				: String(writeResult.error)
-		)
+		console.error("Error writing SQL file:", writeResult.error.toString())
 		process.exit(1)
 	}
-	console.log("Report file written successfully")
+
+	console.log("SQL script file written successfully")
 }
 
 if (require.main === module) {
-	main()
+	main().catch(console.error)
 }
