@@ -25,7 +25,11 @@ const SQLExpressionSchema = z.object({
 type GroupedMappings = Record<string, Record<string, ColumnMapping[]>>
 type ResolvedMappings = Record<string, Record<string, string>>
 
-// Step 1: Identify All Primary and Foreign Keys
+/**
+ * Identifies all primary and foreign key columns in the output database.
+ * @param mapping The mapping object containing input and output databases.
+ * @returns An object with primaryKeys and foreignKeys mappings.
+ */
 function identifyKeyColumns(mapping: Mapping): {
 	primaryKeys: Record<string, string>
 	foreignKeys: Record<string, string[]>
@@ -57,7 +61,11 @@ function identifyKeyColumns(mapping: Mapping): {
 	return { primaryKeys, foreignKeys }
 }
 
-// Step 2: Group mappings by destination table and column, excluding PK and FK mappings
+/**
+ * Groups column mappings by destination table and column, excluding PK and FK mappings.
+ * @param mapping The mapping object.
+ * @returns Grouped mappings by table and column.
+ */
 export function groupMappingsByDestination(mapping: Mapping): GroupedMappings {
 	const { primaryKeys, foreignKeys } = identifyKeyColumns(mapping)
 	const grouped: GroupedMappings = {}
@@ -84,7 +92,12 @@ export function groupMappingsByDestination(mapping: Mapping): GroupedMappings {
 	return grouped
 }
 
-// Step 3 & 4: Resolve mappings into single SQL expressions, including PK and FK mapping with placeholders
+/**
+ * Resolves mappings into single SQL expressions, including PK and FK placeholders.
+ * @param grouped Grouped mappings from previous step.
+ * @param mapping The mapping object.
+ * @returns Resolved mappings with SQL expressions or placeholders.
+ */
 async function resolveMappings(
 	grouped: GroupedMappings,
 	mapping: Mapping
@@ -144,7 +157,11 @@ async function resolveMappings(
 	return resolved
 }
 
-// Helper function to resolve duplicate mappings for non-key columns
+/**
+ * Resolves duplicate mappings for non-key columns into a single SQL expression.
+ * @param duplicates Array of duplicate column mappings.
+ * @returns The resolved SQL expression.
+ */
 async function resolveDuplicateMapping(
 	duplicates: ColumnMapping[]
 ): Promise<string> {
@@ -184,7 +201,12 @@ async function resolveDuplicateMapping(
 	return result
 }
 
-// Step 5: Identify each table's primary key and check if it's mapped
+/**
+ * Checks the mapping status of primary keys for all tables.
+ * @param mapping The mapping object.
+ * @param grouped Grouped mappings.
+ * @returns Mapping status for each table's primary key.
+ */
 export function getPrimaryKeyMappingStatus(
 	mapping: Mapping,
 	grouped: GroupedMappings
@@ -211,7 +233,11 @@ export function getPrimaryKeyMappingStatus(
 	return status
 }
 
-// Step 6: Build a dependency graph based on foreign keys
+/**
+ * Builds a dependency graph based on foreign key relationships.
+ * @param mapping The mapping object.
+ * @returns Dependency graph where each table maps to its referenced tables.
+ */
 export function buildDependencyGraph(
 	mapping: Mapping
 ): Record<string, string[]> {
@@ -233,7 +259,11 @@ export function buildDependencyGraph(
 	return graph
 }
 
-// Step 7: Sort the tables by dependencies and spot cycles
+/**
+ * Performs a topological sort on the dependency graph and detects cycles.
+ * @param graph The dependency graph.
+ * @returns An object with the topological order and a flag indicating cycles.
+ */
 export function topologicalSort(graph: Record<string, string[]>): {
 	order: string[]
 	hasCycles: boolean
@@ -269,11 +299,43 @@ export function topologicalSort(graph: Record<string, string[]>): {
 	return { order: order.reverse(), hasCycles }
 }
 
-// Step 8: Generate Insert Statements for Non-Cyclic Tables
+/**
+ * Determines whether to skip an insert statement based on PRD Step 3 conditions.
+ * @param columnsToInsert Columns included in the insert.
+ * @param values Values included in the insert.
+ * @param pkColumn The primary key column.
+ * @param tableKey The table identifier (schema.table).
+ * @param referencedTables Set of tables referenced by others.
+ * @returns True if the insert should be skipped, false otherwise.
+ */
+function shouldSkipInsert(
+	columnsToInsert: string[],
+	values: string[],
+	pkColumn: string,
+	tableKey: string,
+	referencedTables: Set<string>
+): boolean {
+	return (
+		columnsToInsert.length === 1 &&
+		columnsToInsert[0] === pkColumn &&
+		!referencedTables.has(tableKey)
+	)
+}
+
+/**
+ * Generates insert statements for non-cyclic tables, implementing Step 3 and 4.
+ * Skips PK-only inserts for unreferenced tables, preserves non-PK-only inserts.
+ * @param resolvedMappings Resolved mappings with placeholders.
+ * @param primaryKeyStatus Primary key status for each table.
+ * @param topologicalOrder Topologically sorted table order.
+ * @param referencedTables Set of referenced tables.
+ * @returns Array of insert statements.
+ */
 function generateInsertStatements(
 	resolvedMappings: ResolvedMappings,
 	primaryKeyStatus: Record<string, { primaryKey: string; isMapped: boolean }>,
-	topologicalOrder: string[]
+	topologicalOrder: string[],
+	referencedTables: Set<string>
 ): string[] {
 	const inserts: string[] = []
 
@@ -298,6 +360,7 @@ function generateInsertStatements(
 			)
 		}
 
+		// Include all additional columns (Step 4: Preserve non-PK-only inserts)
 		for (const column in tableMappings) {
 			if (column !== pkColumn) {
 				columnsToInsert.push(column)
@@ -305,7 +368,16 @@ function generateInsertStatements(
 			}
 		}
 
-		if (columnsToInsert.length > 0) {
+		// Step 3: Skip PK-only inserts for unreferenced tables or those inserting only NULLs beyond pk
+		if (
+			!shouldSkipInsert(
+				columnsToInsert,
+				values,
+				pkColumn,
+				tableKey,
+				referencedTables
+			)
+		) {
 			const insertSql = `INSERT INTO ${schema}.${table} (${columnsToInsert.join(", ")}) VALUES (${values.join(", ")});`
 			inserts.push(insertSql)
 		}
@@ -314,14 +386,11 @@ function generateInsertStatements(
 	return inserts
 }
 
-// Step 7: Handle Cycles in Dependencies
-
 /**
- * Identifies foreign keys to set to NULL during INSERT to break cycles, based on topological order.
- * If a referenced table appears after the current table in the order, its FK is set to NULL.
- * @param table The table to analyze for foreign key constraints.
- * @param topologicalOrder The order of tables from topological sort.
- * @returns Array of foreign key column names to set to NULL during insertion.
+ * Identifies foreign keys to set to NULL during insert to break cycles.
+ * @param table The table to analyze.
+ * @param topologicalOrder The topological order of tables.
+ * @returns Array of FK columns to set to NULL.
  */
 function getForeignKeysToSetNull(
 	table: Table,
@@ -346,19 +415,21 @@ function getForeignKeysToSetNull(
 }
 
 /**
- * Generates INSERT statements for tables, handling cycles by setting conflicting FKs to NULL.
- * Tracks which FKs need subsequent updates to their correct placeholder values.
- * @param resolvedMappings Mappings with placeholders for PKs and FKs from prior steps.
+ * Generates insert statements for tables with cycles, implementing Step 3 and 4.
+ * Skips PK-only inserts for unreferenced tables, preserves non-PK-only inserts and cycle handling.
+ * @param resolvedMappings Resolved mappings with placeholders.
  * @param primaryKeyStatus Primary key status for each table.
- * @param tables The output tables from the Mapping object.
- * @param topologicalOrder The order of tables, possibly imperfect due to cycles.
- * @returns An object with INSERT statements and a record of columns needing updates.
+ * @param tables Output tables from the mapping.
+ * @param topologicalOrder Topological order of tables.
+ * @param referencedTables Set of referenced tables.
+ * @returns Object with inserts and columns needing updates.
  */
 function generateInsertStatementsWithCycles(
 	resolvedMappings: ResolvedMappings,
 	primaryKeyStatus: Record<string, { primaryKey: string; isMapped: boolean }>,
 	tables: Table[],
-	topologicalOrder: string[]
+	topologicalOrder: string[],
+	referencedTables: Set<string>
 ): { inserts: string[]; updatesNeeded: Record<string, string[]> } {
 	const inserts: string[] = []
 	const updatesNeeded: Record<string, string[]> = {}
@@ -381,16 +452,16 @@ function generateInsertStatementsWithCycles(
 		const columnsToInsert: string[] = []
 		const values: string[] = []
 
-		// Include primary key with its placeholder
+		// Include primary key
 		if (tableMappings[pkInfo.primaryKey]) {
 			columnsToInsert.push(pkInfo.primaryKey)
 			values.push(tableMappings[pkInfo.primaryKey])
 		}
 
-		// Identify FKs to set to NULL due to cycles
+		// Identify FKs to set to NULL for cycle breaking
 		const fkToSetNull = getForeignKeysToSetNull(table, topologicalOrder)
 
-		// Process all mapped columns
+		// Include all additional columns (Step 4: Preserve non-PK-only inserts)
 		for (const column in tableMappings) {
 			if (column === pkInfo.primaryKey) {
 				continue
@@ -405,7 +476,16 @@ function generateInsertStatementsWithCycles(
 			}
 		}
 
-		if (columnsToInsert.length > 0) {
+		// Step 3: Skip PK-only inserts or those inserting only NULLs for unreferenced tables
+		if (
+			!shouldSkipInsert(
+				columnsToInsert,
+				values,
+				pkInfo.primaryKey,
+				tableKey,
+				referencedTables
+			)
+		) {
 			const insertSql = `INSERT INTO ${schema}.${tableName} (${columnsToInsert.join(", ")}) VALUES (${values.join(", ")});`
 			inserts.push(insertSql)
 		}
@@ -415,13 +495,12 @@ function generateInsertStatementsWithCycles(
 }
 
 /**
- * Generates UPDATE statements to set FKs (previously NULL) to their correct placeholder values after all inserts.
- * Uses the primary key placeholder to identify rows accurately.
- * @param resolvedMappings Mappings with placeholders for PKs and FKs.
+ * Generates update statements to set FKs to their correct values after inserts.
+ * @param resolvedMappings Resolved mappings with placeholders.
  * @param primaryKeyStatus Primary key status for each table.
- * @param tables The output tables from the Mapping object.
- * @param updatesNeeded Record of tables and their FK columns needing updates.
- * @returns An array of MySQL UPDATE statements.
+ * @param tables Output tables from the mapping.
+ * @param updatesNeeded Record of columns needing updates.
+ * @returns Array of update statements.
  */
 function generateUpdateStatements(
 	resolvedMappings: ResolvedMappings,
@@ -467,37 +546,42 @@ function generateUpdateStatements(
 	return updates
 }
 
-// Step 8: Tie It All Together in generateFinalSql
+/**
+ * Generates the final SQL script, incorporating all steps including 3 and 4.
+ * @param mapping The mapping object.
+ * @returns The complete SQL script as a string.
+ */
 async function generateFinalSql(mapping: Mapping): Promise<string> {
-	// Step 2: Group mappings, excluding PKs and FKs
 	const grouped = groupMappingsByDestination(mapping)
 
-	// Steps 3 & 4: Resolve mappings with PKs and FKs using placeholders
 	const resolvedResult = await Errors.try(resolveMappings(grouped, mapping))
 	if (resolvedResult.error) {
 		throw Errors.wrap(resolvedResult.error, "Failed to resolve mappings")
 	}
 	const resolvedMappings = resolvedResult.data
 
-	// Step 5: Get primary key status for all tables
 	const primaryKeyStatus = getPrimaryKeyMappingStatus(mapping, grouped)
-
-	// Step 6: Build dependency graph based on FK relationships
 	const graph = buildDependencyGraph(mapping)
 
-	// Step 7: Determine insertion order and detect cycles
-	const { order: topologicalOrder, hasCycles } = topologicalSort(graph)
+	// Determine referenced tables (from Step 1, already completed)
+	const referencedTables = new Set<string>()
+	for (const tableKey in graph) {
+		for (const dependency of graph[tableKey]) {
+			referencedTables.add(dependency)
+		}
+	}
 
+	const { order: topologicalOrder, hasCycles } = topologicalSort(graph)
 	let sqlStatements: string[] = []
 
 	if (hasCycles) {
-		// Handle cycles (Step 7 continuation)
 		const cycleResult = Errors.trySync(() =>
 			generateInsertStatementsWithCycles(
 				resolvedMappings,
 				primaryKeyStatus,
 				mapping.out.tables,
-				topologicalOrder
+				topologicalOrder,
+				referencedTables
 			)
 		)
 		if (cycleResult.error) {
@@ -517,7 +601,6 @@ async function generateFinalSql(mapping: Mapping): Promise<string> {
 			throw Errors.wrap(updatesResult.error, "Failed to generate updates")
 		}
 
-		// Wrap in transaction and disable FK checks for cycles
 		sqlStatements = [
 			"SET FOREIGN_KEY_CHECKS = 0;",
 			"START TRANSACTION;",
@@ -527,12 +610,12 @@ async function generateFinalSql(mapping: Mapping): Promise<string> {
 			"SET FOREIGN_KEY_CHECKS = 1;"
 		]
 	} else {
-		// No cycles, generate inserts in topological order
 		const insertsResult = Errors.trySync(() =>
 			generateInsertStatements(
 				resolvedMappings,
 				primaryKeyStatus,
-				topologicalOrder
+				topologicalOrder,
+				referencedTables
 			)
 		)
 		if (insertsResult.error) {
@@ -541,11 +624,14 @@ async function generateFinalSql(mapping: Mapping): Promise<string> {
 		sqlStatements = insertsResult.data
 	}
 
-	// Return final SQL script as a single string
 	return sqlStatements.join("\n")
 }
 
-// Load mapping from a JSON file
+/**
+ * Loads a mapping from a JSON file.
+ * @param filePath Path to the mapping file.
+ * @returns The parsed mapping object.
+ */
 async function loadMapping(filePath: string): Promise<Mapping> {
 	const fileResult = await Errors.try(fs.readFile(filePath, "utf-8"))
 	if (fileResult.error) {
@@ -565,7 +651,9 @@ async function loadMapping(filePath: string): Promise<Mapping> {
 	return result.data
 }
 
-// Main function to execute the process
+/**
+ * Main execution function to generate and write the SQL script.
+ */
 async function main() {
 	console.log("Starting insert query generation process")
 
