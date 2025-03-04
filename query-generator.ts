@@ -7,117 +7,65 @@ import type {
 } from "./relational"
 import { Errors } from "./errors"
 
-// Step 1: Group mappings by destination table and then by source table
+// Step 1: Group mappings by destination table and column
 type GroupedMappings = Record<string, Record<string, ColumnMapping[]>>
 
 /**
- * Groups column mappings by their destination table and then by source table.
+ * Groups column mappings by their destination table and column.
  * @param mapping The Mapping object containing columnMappings to organize.
- * @returns A nested structure where outer keys are "destinationSchema.destinationTable",
- *          inner keys are "sourceSchema.sourceTable", and values are arrays of ColumnMapping objects.
+ * @returns A nested structure where outer keys are "schema.table" and inner keys are columns,
+ *          each mapping to an array of ColumnMapping objects.
  */
 export function groupMappingsByDestination(mapping: Mapping): GroupedMappings {
 	const grouped: GroupedMappings = {}
 
 	for (const colMapping of mapping.columnMappings) {
-		const destTableKey = `${colMapping.destinationSchema}.${colMapping.destinationTable}`
-		const sourceTableKey = `${colMapping.sourceSchema}.${colMapping.sourceTable}`
+		const tableKey = `${colMapping.destinationSchema}.${colMapping.destinationTable}`
+		const columnName = colMapping.destinationColumn
 
-		if (!grouped[destTableKey]) {
-			grouped[destTableKey] = {}
+		if (!grouped[tableKey]) {
+			grouped[tableKey] = {}
 		}
 
-		if (!grouped[destTableKey][sourceTableKey]) {
-			grouped[destTableKey][sourceTableKey] = []
+		if (!grouped[tableKey][columnName]) {
+			grouped[tableKey][columnName] = []
 		}
 
-		grouped[destTableKey][sourceTableKey].push(colMapping)
+		grouped[tableKey][columnName].push(colMapping)
 	}
 
 	return grouped
 }
 
-// Step 2: Resolve mappings into single SQL expressions per source table
-type ResolvedMappings = Record<
-	string, // destTableKey
-	Record<
-		string, // sourceTableKey
-		Record<string, string> // destColumn to resolved expression
-	>
->
+// Step 2: Resolve mappings into single SQL expressions
+type ResolvedMappings = Record<string, Record<string, string>>
 
 /**
- * Resolves mappings for each source table to destination table, ensuring exactly one mapping to the primary key.
+ * Resolves duplicate mappings into a single SQL expression for each column.
+ * For single mappings, uses the source column directly. For duplicates, combines them using a mock AI function.
  * @param grouped The grouped mappings from Step 1.
- * @param mapping The Mapping object to access table constraints.
- * @returns A promise resolving to a structure with SQL expressions for each column per source table per destination table.
+ * @returns A promise resolving to a structure with SQL expressions for each column in each table.
  */
 async function resolveMappings(
-	grouped: GroupedMappings,
-	mapping: Mapping
+	grouped: GroupedMappings
 ): Promise<ResolvedMappings> {
 	const resolved: ResolvedMappings = {}
 
-	// Get primary keys for destination tables
-	const primaryKeys: Record<string, string> = {}
-	for (const table of mapping.out.tables) {
-		const tableKey = `${table.schema}.${table.name}`
-		const pkConstraint = table.constraints.find(
-			(c): c is PrimaryKeyConstraint => c.constraintType === "primaryKey"
-		)
-		if (!pkConstraint || pkConstraint.columns.length !== 1) {
-			throw new Error(
-				`Table ${tableKey} must have a single primary key constraint.`
-			)
-		}
-		primaryKeys[tableKey] = pkConstraint.columns[0]
-	}
-
-	for (const destTableKey in grouped) {
-		resolved[destTableKey] = {}
-		const pkColumn = primaryKeys[destTableKey]
-		if (!pkColumn) {
-			throw new Error(`No primary key found for ${destTableKey}`)
-		}
-
-		for (const sourceTableKey in grouped[destTableKey]) {
-			const mappings = grouped[destTableKey][sourceTableKey]
-			// Group mappings by destination column
-			const columnMappings: Record<string, ColumnMapping[]> = {}
-			for (const cm of mappings) {
-				if (!columnMappings[cm.destinationColumn]) {
-					columnMappings[cm.destinationColumn] = []
+	for (const tableKey in grouped) {
+		resolved[tableKey] = {}
+		for (const column in grouped[tableKey]) {
+			const mappings = grouped[tableKey][column]
+			if (mappings.length === 1) {
+				const cm = mappings[0]
+				resolved[tableKey][column] =
+					`:${cm.sourceSchema}.${cm.sourceTable}.${cm.sourceColumn}`
+			} else {
+				const result = await Errors.try(resolveDuplicateMapping(mappings))
+				if (result.error) {
+					throw result.error
 				}
-				columnMappings[cm.destinationColumn].push(cm)
+				resolved[tableKey][column] = result.data
 			}
-
-			// Check primary key mapping
-			const pkMappings = columnMappings[pkColumn] || []
-			if (pkMappings.length !== 1) {
-				throw new Error(
-					`Exactly one mapping required for primary key ${pkColumn} in ${destTableKey} from ${sourceTableKey}, but found ${pkMappings.length}`
-				)
-			}
-
-			// Resolve mappings
-			const resolvedForSource: Record<string, string> = {}
-			for (const destColumn in columnMappings) {
-				const cms = columnMappings[destColumn]
-				if (cms.length === 1) {
-					const cm = cms[0]
-					resolvedForSource[destColumn] =
-						`${cm.sourceSchema}.${cm.sourceTable}.${cm.sourceColumn}`
-				} else {
-					// Multiple mappings to non-primary key column
-					const result = await Errors.try(resolveDuplicateMapping(cms))
-					if (result.error) {
-						throw result.error
-					}
-					resolvedForSource[destColumn] = result.data
-				}
-			}
-
-			resolved[destTableKey][sourceTableKey] = resolvedForSource
 		}
 	}
 
@@ -135,10 +83,10 @@ async function resolveDuplicateMapping(
 ): Promise<string> {
 	const destColumn = duplicates[0].destinationColumn
 	if (destColumn === "validFor") {
-		return `CONCAT(${duplicates[0].sourceSchema}.${duplicates[0].sourceTable}.${duplicates[0].sourceColumn}, ' to ', ${duplicates[1].sourceSchema}.${duplicates[1].sourceTable}.${duplicates[1].sourceColumn})`
+		return `CONCAT(:${duplicates[0].sourceSchema}.${duplicates[0].sourceTable}.${duplicates[0].sourceColumn}, ' to ', :${duplicates[1].sourceSchema}.${duplicates[1].sourceTable}.${duplicates[1].sourceColumn})`
 	}
 	if (destColumn === "name") {
-		return `COALESCE(${duplicates[0].sourceSchema}.${duplicates[0].sourceTable}.${duplicates[0].sourceColumn}, ${duplicates[1].sourceSchema}.${duplicates[1].sourceTable}.${duplicates[1].sourceColumn})`
+		return `COALESCE(:${duplicates[0].sourceSchema}.${duplicates[0].sourceTable}.${duplicates[0].sourceColumn}, :${duplicates[1].sourceSchema}.${duplicates[1].sourceTable}.${duplicates[1].sourceColumn})`
 	}
 	throw new Error(`No mock resolution defined for column ${destColumn}`)
 }
@@ -246,7 +194,7 @@ export function topologicalSort(graph: Record<string, string[]>): {
 
 // Step 6: Generate Insert Statements for Non-Cyclic Tables
 /**
- * Generates MySQL INSERT statements for non-cyclic tables in topological order, one per source table.
+ * Generates MySQL INSERT statements for non-cyclic tables in topological order.
  * @param resolvedMappings Resolved mappings from Step 2.
  * @param primaryKeyStatus Primary key status from Step 3.
  * @param topologicalOrder Topological order from Step 5.
@@ -261,18 +209,30 @@ function generateInsertStatements(
 
 	for (const tableKey of topologicalOrder) {
 		const [schema, table] = tableKey.split(".")
-		const sourceTables = resolvedMappings[tableKey] || {}
-		for (const sourceTableKey in sourceTables) {
-			const mappings = sourceTables[sourceTableKey]
-			const columnsToInsert: string[] = Object.keys(mappings)
-			const selectExpressions: string[] = columnsToInsert.map(
-				(col) => mappings[col]
-			)
+		const tableMappings = resolvedMappings[tableKey] || {}
+		const pkInfo = primaryKeyStatus[tableKey]
+		if (!pkInfo) {
+			throw new Error(`No primary key info for table ${tableKey}`)
+		}
 
-			if (columnsToInsert.length > 0) {
-				const insertSql = `INSERT INTO ${schema}.${table} (${columnsToInsert.join(", ")}) SELECT ${selectExpressions.join(", ")} FROM ${sourceTableKey};`
-				inserts.push(insertSql)
+		const columnsToInsert: string[] = []
+		const values: string[] = []
+
+		if (pkInfo.isMapped && tableMappings[pkInfo.primaryKey]) {
+			columnsToInsert.push(pkInfo.primaryKey)
+			values.push(tableMappings[pkInfo.primaryKey])
+		}
+
+		for (const column in tableMappings) {
+			if (column !== pkInfo.primaryKey) {
+				columnsToInsert.push(column)
+				values.push(tableMappings[column])
 			}
+		}
+
+		if (columnsToInsert.length > 0) {
+			const insertSql = `INSERT INTO ${schema}.${table} (${columnsToInsert.join(", ")}) VALUES (${values.join(", ")});`
+			inserts.push(insertSql)
 		}
 	}
 
@@ -334,11 +294,8 @@ function generateInsertStatementsWithCycles(
 			throw new Error(`Table ${tableKey} not found`)
 		}
 
-		const sourceTables = resolvedMappings[tableKey] || {}
-		const sourceTableKey = Object.keys(sourceTables)[0] // Assume first source table
-		const tableMappings = sourceTableKey ? sourceTables[sourceTableKey] : {}
+		const tableMappings = resolvedMappings[tableKey] || {}
 		const pkInfo = primaryKeyStatus[tableKey]
-
 		if (!pkInfo) {
 			throw new Error(`No primary key info for ${tableKey}`)
 		}
@@ -346,7 +303,7 @@ function generateInsertStatementsWithCycles(
 		const columnsToInsert: string[] = []
 		const values: string[] = []
 
-		if (pkInfo.isMapped && pkInfo.primaryKey in tableMappings) {
+		if (pkInfo.isMapped && tableMappings[pkInfo.primaryKey]) {
 			columnsToInsert.push(pkInfo.primaryKey)
 			values.push(tableMappings[pkInfo.primaryKey])
 		}
@@ -443,7 +400,7 @@ function generateUpdateStatements(
 async function generateFinalSql(mapping: Mapping): Promise<string> {
 	const grouped = groupMappingsByDestination(mapping)
 
-	const resolvedResult = await Errors.try(resolveMappings(grouped, mapping))
+	const resolvedResult = await Errors.try(resolveMappings(grouped))
 	if (resolvedResult.error) {
 		throw Errors.wrap(resolvedResult.error, "Failed to resolve mappings")
 	}
